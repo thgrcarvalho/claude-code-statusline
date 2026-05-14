@@ -56,3 +56,4 @@ echo "Fetching initial pricing data..."
 
 echo ""
 echo "Done. Restart Claude Code to see the statusline."
+echo "To revert to your previous setup, run: $(cd "$(dirname "$0")" && pwd)/uninstall.sh"

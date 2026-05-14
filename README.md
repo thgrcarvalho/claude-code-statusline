@@ -108,6 +108,18 @@ If you prefer to install by hand:
 
 ---
 
+## Uninstall / Revert
+
+`install.sh` creates timestamped backups of anything it overwrites (`~/.claude/statusline.sh.bak.<ts>`, `~/.claude/settings.json.bak.<ts>`, etc.). To go back:
+
+```bash
+./uninstall.sh
+```
+
+If you've run the installer more than once, `uninstall.sh` lists all available backup timestamps and lets you choose which one to restore. It also handles the case where no prior statusline existed — removing the installed files and cleaning the `statusLine` key from `settings.json`.
+
+---
+
 ## How it works
 
 The statusline script is invoked by Claude Code every second via `refreshInterval: 1`. It receives a JSON blob on stdin with the current session state and prints the status lines.
