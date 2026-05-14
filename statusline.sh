@@ -1,6 +1,7 @@
 #!/bin/bash
 # Claude Code status line — model · context % · cost · cache breakdown · per-model totals (incl. sub-agents)
 input=$(cat)
+export LC_ALL=C   # force period as decimal separator regardless of system locale
 
 # Colors
 RESET=$'\033[0m'
@@ -150,7 +151,8 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
     # Parse: deduplicate by uuid, group by model, sum usage
     # Split cache_creation into 5min and 1hr for accurate pricing
     (jq -rs '
-      [.[] | select(.message.role == "assistant" and .message.usage != null) |
+      [.[] | select(.message.role == "assistant" and .message.usage != null
+               and (.message.model | strings | startswith("claude-"))) |
         { uuid,
           model: .message.model,
           in:   (.message.usage.input_tokens // 0),
