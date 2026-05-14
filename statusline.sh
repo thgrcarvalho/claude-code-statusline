@@ -15,20 +15,22 @@ YELLOW=$'\033[33m'
 RED=$'\033[91m'
 BLUE=$'\033[34m'
 
-# Extract a string value from harness JSON: grep the field name, capture the quoted value
-_str() { echo "$input" | grep "\"$1\"" | sed -E 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'; }
-# Extract a numeric value (int or float): find the digit sequence after the field name
-_num() { echo "$input" | grep "\"$1\"" | grep -oE '[0-9]+\.?[0-9]*' | head -1; }
+# Extract a top-level string field (unambiguous keys like session_id, transcript_path)
+_str()  { echo "$input" | grep "\"$1\"" | head -1 | sed -E 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'; }
+# Extract a string field scoped to a parent section (avoids matching duplicate keys in other sections)
+_sstr() { echo "$input" | grep -A20 "\"$1\"[[:space:]]*:" | grep "\"$2\"" | head -1 | sed -E 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'; }
+# Extract a numeric field scoped to a parent section
+_snum() { echo "$input" | grep -A20 "\"$1\"[[:space:]]*:" | grep "\"$2\"" | head -1 | grep -oE '[0-9]+\.?[0-9]*' | head -1; }
 
-model=$(         _str display_name)
-ctx_pct=$(       _num used_percentage)
-ctx_kb=$(        _num context_window_size | awk '{printf "%d", $1/1000}')
-cost=$(          _num total_cost_usd)
-tok_fresh=$(     _num input_tokens)
-tok_cr=$(        _num cache_read_input_tokens)
-tok_cw=$(        _num cache_creation_input_tokens)
-tok_out=$(       _num output_tokens)
-session_id=$(    _str session_id)
+model=$(         _sstr model           display_name)
+ctx_pct=$(       _snum context_window  used_percentage)
+ctx_kb=$(        _snum context_window  context_window_size | awk '{printf "%d", $1/1000}')
+cost=$(          _snum cost            total_cost_usd)
+tok_fresh=$(     _snum current_usage   input_tokens)
+tok_cr=$(        _snum current_usage   cache_read_input_tokens)
+tok_cw=$(        _snum current_usage   cache_creation_input_tokens)
+tok_out=$(       _snum current_usage   output_tokens)
+session_id=$(    _str  session_id)
 transcript_path=$(_str transcript_path)
 
 model="${model:-?}"
