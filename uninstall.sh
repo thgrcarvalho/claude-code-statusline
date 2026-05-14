@@ -66,11 +66,22 @@ if [ -f "$BAK_SETTINGS" ]; then
   cp "$BAK_SETTINGS" "$SETTINGS"
   echo "  Restored  $SETTINGS"
 else
-  # settings.json didn't exist before — just remove our statusLine key
-  if [ -f "$SETTINGS" ] && command -v jq >/dev/null 2>&1; then
-    jq 'del(.statusLine)' "$SETTINGS" > "$SETTINGS.tmp" \
-      && mv "$SETTINGS.tmp" "$SETTINGS"
-    echo "  Removed statusLine key from $SETTINGS"
+  # settings.json didn't exist before — remove the statusLine key we added
+  if [ -f "$SETTINGS" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      jq 'del(.statusLine)' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+      echo "  Removed statusLine key from $SETTINGS"
+    elif command -v python3 >/dev/null 2>&1; then
+      python3 - "$SETTINGS" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f: d = json.load(f)
+d.pop('statusLine', None)
+with open(sys.argv[1], 'w') as f: json.dump(d, f, indent=2)
+PY
+      echo "  Removed statusLine key from $SETTINGS"
+    else
+      echo "  Note: remove the 'statusLine' key from $SETTINGS manually."
+    fi
   fi
 fi
 

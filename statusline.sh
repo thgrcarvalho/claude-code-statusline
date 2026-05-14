@@ -1,5 +1,6 @@
 #!/bin/bash
 # Claude Code status line — model · context % · cost · cache breakdown · per-model totals (incl. sub-agents)
+# Dependencies: bash 3.2+, awk, sed, grep (POSIX standard — no jq or python required)
 input=$(cat)
 export LC_ALL=C   # force period as decimal separator regardless of system locale
 
@@ -14,16 +15,31 @@ YELLOW=$'\033[33m'
 RED=$'\033[91m'
 BLUE=$'\033[34m'
 
-model=$(echo "$input"        | jq -r '.model.display_name // "?"')
-ctx_pct=$(echo "$input"      | jq -r '.context_window.used_percentage // 0')
-ctx_kb=$(echo "$input"       | jq -r '.context_window.context_window_size // 0 | . / 1000 | floor')
-cost=$(echo "$input"         | jq -r '.cost.total_cost_usd // 0')
-tok_fresh=$(echo "$input"    | jq -r '.context_window.current_usage.input_tokens // 0')
-tok_cr=$(echo "$input"       | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
-tok_cw=$(echo "$input"       | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
-tok_out=$(echo "$input"      | jq -r '.context_window.current_usage.output_tokens // 0')
-session_id=$(echo "$input"   | jq -r '.session_id // "default"')
-transcript_path=$(echo "$input" | jq -r '.transcript_path // ""')
+# Extract a string value from harness JSON: grep the field name, capture the quoted value
+_str() { echo "$input" | grep "\"$1\"" | sed -E 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'; }
+# Extract a numeric value (int or float): find the digit sequence after the field name
+_num() { echo "$input" | grep "\"$1\"" | grep -oE '[0-9]+\.?[0-9]*' | head -1; }
+
+model=$(         _str display_name)
+ctx_pct=$(       _num used_percentage)
+ctx_kb=$(        _num context_window_size | awk '{printf "%d", $1/1000}')
+cost=$(          _num total_cost_usd)
+tok_fresh=$(     _num input_tokens)
+tok_cr=$(        _num cache_read_input_tokens)
+tok_cw=$(        _num cache_creation_input_tokens)
+tok_out=$(       _num output_tokens)
+session_id=$(    _str session_id)
+transcript_path=$(_str transcript_path)
+
+model="${model:-?}"
+ctx_pct="${ctx_pct:-0}"
+ctx_kb="${ctx_kb:-0}"
+cost="${cost:-0}"
+tok_fresh="${tok_fresh:-0}"
+tok_cr="${tok_cr:-0}"
+tok_cw="${tok_cw:-0}"
+tok_out="${tok_out:-0}"
+session_id="${session_id:-default}"
 
 # Derive a friendly display name from an API model ID.
 # Handles all current and future Claude models without hardcoding versions.
@@ -58,20 +74,17 @@ model_display() {
 
 # Pricing: base_input, output (USD per million tokens)
 # Cache prices derived at use-time: read=0.10×, write_5m=1.25×, write_1h=2.00× of base
-# Live rates read from /tmp/claude_pricing.json (refreshed daily by refresh-pricing.sh)
+# Live rates read from /tmp/claude_pricing.txt if refresh-pricing.sh has run (requires jq)
 pricing_for() {
-  local cache="/tmp/claude_pricing.json"
+  local cache="/tmp/claude_pricing.txt"
   local model_id="$1"
   local norm_id
-  # Normalize: strip "anthropic/" prefix and trailing -YYYYMMDD date
   norm_id=$(echo "$model_id" | sed -E 's|^anthropic/||; s|-[0-9]{8}$||')
 
   if [ -f "$cache" ]; then
     local rates
-    rates=$(jq -r --arg m "$norm_id" \
-      '.[$m] | select(. != null) | "\(.input) \(.output)"' \
-      "$cache" 2>/dev/null)
-    if [ -n "$rates" ] && [ "$rates" != " " ]; then
+    rates=$(grep -m1 "^${norm_id} " "$cache" | awk '{print $2, $3}')
+    if [ -n "$rates" ]; then
       echo "$rates"
       return
     fi
@@ -134,9 +147,9 @@ else hit_color=$RED; fi
 # State dir per session
 STATE_DIR="/tmp/claude_session_${session_id}"
 mkdir -p "$STATE_DIR" 2>/dev/null
-LAST_STATE="${STATE_DIR}/last_api.ts"               # last API response timestamp
-SESSION_COST="${STATE_DIR}/session_cost.txt"        # total cost from Σ breakdown
-MODEL_BREAKDOWN="${STATE_DIR}/model_breakdown.json" # per-model totals from JSONL
+LAST_STATE="${STATE_DIR}/last_api.ts"
+SESSION_COST="${STATE_DIR}/session_cost.txt"
+MODEL_BREAKDOWN="${STATE_DIR}/model_breakdown.txt"  # space-delimited: model in cr cw5m cw1h out
 
 now=$(date +%s)
 prev_tout="-1"
@@ -164,31 +177,54 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
       done
     fi
 
-    # Parse: deduplicate by uuid, group by model, sum usage
-    # Split cache_creation into 5min and 1hr for accurate pricing
-    (jq -rs '
-      [.[] | select(.message.role == "assistant" and .message.usage != null
-               and (.message.model | strings | startswith("claude-"))) |
-        { uuid,
-          model: .message.model,
-          in:   (.message.usage.input_tokens // 0),
-          cr:   (.message.usage.cache_read_input_tokens // 0),
-          cw5m: (.message.usage.cache_creation.ephemeral_5m_input_tokens // 0),
-          cw1h: (.message.usage.cache_creation.ephemeral_1h_input_tokens // .message.usage.cache_creation_input_tokens // 0),
-          out:  (.message.usage.output_tokens // 0)
-        }
-      ] |
-      unique_by(.uuid) |
-      group_by(.model) |
-      map({
-        model: .[0].model,
-        in:   (map(.in)   | add),
-        cr:   (map(.cr)   | add),
-        cw5m: (map(.cw5m) | add),
-        cw1h: (map(.cw1h) | add),
-        out:  (map(.out)  | add)
-      })
-    ' "${jsonl_files[@]}" > "${MODEL_BREAKDOWN}.tmp" 2>/dev/null && \
+    # Parse JSONL with awk: deduplicate by uuid, group by model, sum token counts
+    # Output format: "<model> <in> <cr> <cw5m> <cw1h> <out>" — one line per model
+    (awk '
+/\"role\":\"assistant\"/ && /\"usage\"/ && /\"model\":\"claude-/ {
+  uuid = ""
+  if (match($0, /"uuid":"[^"]*"/)) {
+    f = substr($0, RSTART, RLENGTH); gsub(/"uuid":"/, "", f); gsub(/"$/, "", f); uuid = f
+  }
+  if (uuid == "" || uuid in seen) next
+  seen[uuid] = 1
+
+  model = ""
+  if (match($0, /"model":"claude-[^"]*"/)) {
+    f = substr($0, RSTART, RLENGTH); gsub(/"model":"/, "", f); gsub(/"$/, "", f); model = f
+  }
+  if (model == "") next
+
+  in_tok = 0
+  if (match($0, /"input_tokens":[0-9]+/))
+    { f = substr($0, RSTART, RLENGTH); sub(/"input_tokens":/, "", f); in_tok = f+0 }
+
+  cr = 0
+  if (match($0, /"cache_read_input_tokens":[0-9]+/))
+    { f = substr($0, RSTART, RLENGTH); sub(/"cache_read_input_tokens":/, "", f); cr = f+0 }
+
+  cw5m = 0
+  if (match($0, /"ephemeral_5m_input_tokens":[0-9]+/))
+    { f = substr($0, RSTART, RLENGTH); sub(/"ephemeral_5m_input_tokens":/, "", f); cw5m = f+0 }
+
+  cw1h = 0
+  if (match($0, /"ephemeral_1h_input_tokens":[0-9]+/))
+    { f = substr($0, RSTART, RLENGTH); sub(/"ephemeral_1h_input_tokens":/, "", f); cw1h = f+0 }
+  if (cw1h == 0 && match($0, /"cache_creation_input_tokens":[0-9]+/))
+    { f = substr($0, RSTART, RLENGTH); sub(/"cache_creation_input_tokens":/, "", f); cw1h = f+0 }
+
+  out = 0
+  if (match($0, /"output_tokens":[0-9]+/))
+    { f = substr($0, RSTART, RLENGTH); sub(/"output_tokens":/, "", f); out = f+0 }
+
+  in_sum[model] += in_tok; cr_sum[model] += cr
+  cw5m_sum[model] += cw5m; cw1h_sum[model] += cw1h
+  out_sum[model] += out
+}
+END {
+  for (m in in_sum)
+    print m, in_sum[m], cr_sum[m], cw5m_sum[m], cw1h_sum[m], out_sum[m]
+}
+' "${jsonl_files[@]}" > "${MODEL_BREAKDOWN}.tmp" 2>/dev/null && \
       mv "${MODEL_BREAKDOWN}.tmp" "$MODEL_BREAKDOWN") &
   fi
   [ -x "${HOME}/.claude/refresh-pricing.sh" ] && "${HOME}/.claude/refresh-pricing.sh" &
@@ -227,8 +263,7 @@ printf "↑${WHITE}%s${RESET} ${GREEN}+%sr${RESET} ${YELLOW}+%sw${RESET} ↓${BL
 printf "%s hit ${hit_color}%s%%${RESET}" "${sep}" "$cache_pct"
 printf "%s ~ttl ${cache_color}%s${RESET}\n" "${sep}" "$cache_timer"
 
-# Lines 2+: per-model totals from JSONL (parent + sub-agents)
-# Uses process substitution so total_cost accumulates in the main shell
+# Lines 2+: per-model totals — read directly from flat-text breakdown (no jq needed)
 total_cost=0
 if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
   while IFS=' ' read -r m_id m_in m_cr m_cw5m m_cw1h m_out; do
@@ -247,6 +282,6 @@ if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
       "$m_name" \
       "$(fmt_tok $m_in)" "$(fmt_tok $m_cr)" "$(fmt_tok $m_cw_total)" "$(fmt_tok $m_out)" \
       "$(fmt_c $m_cost)"
-  done < <(jq -r '.[] | "\(.model) \(.in) \(.cr) \(.cw5m) \(.cw1h) \(.out)"' "$MODEL_BREAKDOWN" 2>/dev/null)
+  done < "$MODEL_BREAKDOWN"
   echo "$total_cost" > "$SESSION_COST"
 fi
