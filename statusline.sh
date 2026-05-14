@@ -216,6 +216,7 @@ printf "%s ~ttl ${cache_color}%s${RESET}\n" "${sep}" "$cache_timer"
 total_cost=0
 if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
   while IFS=' ' read -r m_id m_in m_cr m_cw5m m_cw1h m_out; do
+    [ "$((m_in + m_cr + m_cw5m + m_cw1h + m_out))" -eq 0 ] && continue
     m_name=$(model_display "$m_id")
     read m_pin m_pout <<< "$(pricing_for "$m_id")"
     m_pcr=$(awk   -v b="$m_pin" 'BEGIN {printf "%.4f", b * 0.10}')
