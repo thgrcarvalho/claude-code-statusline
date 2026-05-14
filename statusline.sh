@@ -25,28 +25,35 @@ tok_out=$(echo "$input"      | jq -r '.context_window.current_usage.output_token
 session_id=$(echo "$input"   | jq -r '.session_id // "default"')
 transcript_path=$(echo "$input" | jq -r '.transcript_path // ""')
 
-# Friendly display name from API model ID or display name
+# Derive a friendly display name from an API model ID.
+# Handles all current and future Claude models without hardcoding versions.
 model_display() {
-  case "$1" in
-    *opus-4-7*|"Opus 4.7")        echo "Opus 4.7" ;;
-    *opus-4-6*|"Opus 4.6")        echo "Opus 4.6" ;;
-    *opus-4-5*|"Opus 4.5")        echo "Opus 4.5" ;;
-    *opus-4-1*|"Opus 4.1")        echo "Opus 4.1" ;;
-    *opus-4*|"Opus 4")            echo "Opus 4"   ;;
-    *opus-3*|"Opus 3")            echo "Opus 3"   ;;
-    *opus*|"Opus"*)               echo "Opus" ;;
-    *sonnet-4-6*|"Sonnet 4.6")    echo "Sonnet 4.6" ;;
-    *sonnet-4-5*|"Sonnet 4.5")    echo "Sonnet 4.5" ;;
-    *sonnet-4*|"Sonnet 4")        echo "Sonnet 4"   ;;
-    *sonnet-3-7*|"Sonnet 3.7")    echo "Sonnet 3.7" ;;
-    *sonnet-3-5*|"Sonnet 3.5")    echo "Sonnet 3.5" ;;
-    *sonnet-3*|"Sonnet 3")        echo "Sonnet 3"   ;;
-    *sonnet*|"Sonnet"*)           echo "Sonnet" ;;
-    *haiku-4-5*|"Haiku 4.5")      echo "Haiku 4.5" ;;
-    *haiku-3*|"Haiku 3")          echo "Haiku 3"   ;;
-    *haiku*|"Haiku"*)             echo "Haiku" ;;
-    *)                            echo "$1" ;;
-  esac
+  local id="$1" family ver minor
+
+  # New-gen IDs: claude-{family}-{major}[-minor][-YYYYMMDD][...]
+  # e.g. claude-opus-4-7-20260416  →  Opus 4.7
+  if [[ "$id" =~ ^claude-(opus|sonnet|haiku)-([0-9].*)$ ]]; then
+    family="${BASH_REMATCH[1]}"
+    ver="${BASH_REMATCH[2]}"
+    ver=$(echo "$ver" | sed -E 's/-[0-9]{8}.*//')  # strip date suffix
+    ver="${ver//-/.}"                                # hyphens → dots
+    case "$family" in opus) family="Opus";; sonnet) family="Sonnet";; haiku) family="Haiku";; esac
+    echo "$family $ver"
+    return
+  fi
+
+  # Old-gen IDs: claude-3[-minor]-{family}[-YYYYMMDD]
+  # e.g. claude-3-5-sonnet-20241022  →  Sonnet 3.5
+  if [[ "$id" =~ ^claude-3(-([0-9]+))?-(opus|sonnet|haiku) ]]; then
+    minor="${BASH_REMATCH[2]}"
+    family="${BASH_REMATCH[3]}"
+    case "$family" in opus) family="Opus";; sonnet) family="Sonnet";; haiku) family="Haiku";; esac
+    [ -n "$minor" ] && echo "$family 3.$minor" || echo "$family 3"
+    return
+  fi
+
+  # Already a display name from harness JSON ("Opus 4.7"), or unknown — pass through
+  echo "$id"
 }
 
 # Pricing: base_input, output (USD per million tokens)
