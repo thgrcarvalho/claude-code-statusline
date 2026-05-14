@@ -1,0 +1,30 @@
+{
+  "session_id": "test-multi-dn",
+  "transcript_path": "/dev/null",
+  "effort": {
+    "display_name": "High",
+    "level": 3
+  },
+  "model": {
+    "id": "claude-opus-4-7",
+    "display_name": "Opus 4.7",
+    "provider": "anthropic"
+  },
+  "output_style": {
+    "display_name": "Default",
+    "verbose": false
+  },
+  "context_window": {
+    "used_percentage": 10,
+    "context_window_size": 1000000
+  },
+  "cost": {
+    "total_cost_usd": 0.10
+  },
+  "current_usage": {
+    "input_tokens": 5,
+    "cache_read_input_tokens": 1000,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 50
+  }
+}

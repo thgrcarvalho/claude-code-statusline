@@ -1,0 +1,2 @@
+{"type":"assistant","uuid":"uuid-synthetic-1","message":{"role":"assistant","model":"<synthetic>","usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}
+{"type":"assistant","uuid":"uuid-haiku-1","message":{"role":"assistant","model":"claude-haiku-4-5","usage":{"input_tokens":100,"cache_read_input_tokens":5000,"cache_creation_input_tokens":0,"output_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}

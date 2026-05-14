@@ -1,0 +1,22 @@
+{
+  "session_id": "test-pretty",
+  "transcript_path": "/dev/null",
+  "model": {
+    "id": "claude-sonnet-4-6",
+    "display_name": "Sonnet 4.6",
+    "provider": "anthropic"
+  },
+  "context_window": {
+    "used_percentage": 9,
+    "context_window_size": 200000
+  },
+  "cost": {
+    "total_cost_usd": 0.12
+  },
+  "current_usage": {
+    "input_tokens": 6,
+    "cache_read_input_tokens": 22000,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 280
+  }
+}

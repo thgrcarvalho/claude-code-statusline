@@ -143,6 +143,18 @@ All configuration is in `statusline.sh`. Common knobs:
 
 ---
 
+## Testing
+
+```bash
+./tests/test.sh
+```
+
+Runs 22 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard (compact JSON with an early numeric field that previously caused all extractions to return the same wrong value), multiple `display_name` ambiguity, JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`), and an end-to-end render with Σ lines.
+
+CI runs automatically on every push and pull request via GitHub Actions (no extra dependencies — `jq` is intentionally absent to verify the no-jq path).
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
