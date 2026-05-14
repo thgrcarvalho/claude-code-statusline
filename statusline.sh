@@ -20,7 +20,13 @@ _str()  { echo "$input" | grep "\"$1\"" | head -1 | sed -E 's/.*"'"$1"'"[[:space
 # Extract a string field scoped to a parent section (avoids matching duplicate keys in other sections)
 _sstr() { echo "$input" | grep -A20 "\"$1\"[[:space:]]*:" | grep "\"$2\"" | head -1 | sed -E 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'; }
 # Extract a numeric field scoped to a parent section
-_snum() { echo "$input" | grep -A20 "\"$1\"[[:space:]]*:" | grep "\"$2\"" | head -1 | grep -oE '[0-9]+\.?[0-9]*' | head -1; }
+_snum() {
+  echo "$input" \
+    | grep -A20 "\"$1\"[[:space:]]*:" \
+    | grep -oE "\"$2\"[[:space:]]*:[[:space:]]*[0-9]+\.?[0-9]*" \
+    | head -1 \
+    | grep -oE '[0-9]+\.?[0-9]*$'
+}
 
 model=$(         _sstr model           display_name)
 ctx_pct=$(       _snum context_window  used_percentage)

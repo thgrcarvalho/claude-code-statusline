@@ -46,8 +46,8 @@ Opus 4.7 │ ctx 14%/200k │ $0.42 │ ↑1 +87kr +2kw ↓312 │ hit 97% │ ~
 
 - [Claude Code](https://claude.ai/code) 2.x
 - `bash` 3.2+ (default on macOS; bash 4+ recommended for best compatibility)
-- `jq` (JSON processor)
 - `curl`
+- `jq` *(optional)* — enables auto-updating pricing from LiteLLM; the statusline works fully without it
 
 ---
 
@@ -70,14 +70,14 @@ Then **restart Claude Code**. The new statusline appears immediately.
 
 ### macOS note
 
-Install `jq` first if you don't have it:
-```bash
-brew install jq
-```
-
 Default macOS bash (3.2) is supported. For bash 4+:
 ```bash
 brew install bash
+```
+
+To enable auto-updating pricing from LiteLLM (optional):
+```bash
+brew install jq
 ```
 
 ---
