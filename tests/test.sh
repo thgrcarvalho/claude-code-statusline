@@ -125,34 +125,48 @@ echo "--- Test 5: missing/empty JSON does not crash"
 out=$(printf '{"session_id":"test-empty"}' | bash "$SCRIPT" 2>/dev/null; echo "exit:$?")
 assert_contains "no crash on sparse JSON" "exit:0" "$out"
 
+echo "--- Test 6: post-/compact ctx from compactMetadata.postTokens (15284/200000=7%)"
+STALE_TRANSCRIPT="$FIXTURES/transcript-stale.jsonl"
+out=$(sed "s|TRANSCRIPT_PATH|$STALE_TRANSCRIPT|" "$FIXTURES/stdin-stale-ctx.json" \
+        | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains     "stale ctx shows 7%"  "ctx 7%"  "$out"
+assert_not_contains "stale ctx hides 0%"  "ctx 0%"  "$out"
+assert_not_contains "no stale ? marker"   "ctx ?%"  "$out"
+
+echo "--- Test 7: fresh session (used_percentage:0 + no transcript) shows 0%"
+out=$(printf '{"session_id":"test-fresh","context_window":{"used_percentage":0,"context_window_size":200000}}' \
+        | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains     "fresh shows 0%"         "ctx 0%"  "$out"
+assert_not_contains "fresh no compact-pct"   "ctx 7%"  "$out"
+
 # ─── JSONL aggregation tests ──────────────────────────────────────────────────
 echo ""
 echo "=== JSONL aggregation ==="
 
-echo "--- Test 6: 2 Opus messages + 1 Sonnet → 2 model rows"
+echo "--- Test 8: 2 Opus messages + 1 Sonnet → 2 model rows"
 breakdown=$(run_breakdown "$FIXTURES/session.jsonl")
 line_count=$(echo "$breakdown" | grep -c "^claude-" 2>/dev/null || true)
 assert_eq "2 model rows" "2" "$line_count"
 
-echo "--- Test 7: Opus input tokens summed (1000+2000=3000, dupe uuid excluded)"
+echo "--- Test 9: Opus input tokens summed (1000+2000=3000, dupe uuid excluded)"
 opus_in=$(echo "$breakdown" | grep "^claude-opus-4-7 " | awk '{print $2}')
 assert_eq "Opus in_tokens=3000" "3000" "$opus_in"
 
-echo "--- Test 8: duplicate uuid counted once (not 12999)"
+echo "--- Test 10: duplicate uuid counted once (not 12999)"
 # uuid-opus-1 appears twice; second entry has in_tokens=9999.  If dedup fails → 12999.
 assert_not_contains "dupe uuid not double-counted" "12999" "$breakdown"
 
-echo "--- Test 9: ephemeral_5m_input_tokens aggregated into cw5m"
+echo "--- Test 11: ephemeral_5m_input_tokens aggregated into cw5m"
 # uuid-opus-1 has ephemeral_5m=500; uuid-opus-2 has 0. Opus cw5m column should be 500.
 opus_cw5m=$(echo "$breakdown" | grep "^claude-opus-4-7 " | awk '{print $4}')
 assert_eq "Opus cw5m=500" "500" "$opus_cw5m"
 
-echo "--- Test 9b: legacy cache_creation_input_tokens used as cw1h fallback"
+echo "--- Test 11b: legacy cache_creation_input_tokens used as cw1h fallback"
 # uuid-opus-2 has cache_creation_input_tokens=1000 and ephemeral_1h=0 → cw1h=1000
 opus_cw1h=$(echo "$breakdown" | grep "^claude-opus-4-7 " | awk '{print $5}')
 assert_eq "Opus cw1h=1000 (legacy fallback)" "1000" "$opus_cw1h"
 
-echo "--- Test 10: synthetic model entry filtered out"
+echo "--- Test 12: synthetic model entry filtered out"
 synth_breakdown=$(run_breakdown "$FIXTURES/session-synthetic.jsonl")
 assert_not_contains "synthetic excluded" "synthetic" "$synth_breakdown"
 assert_contains     "real haiku entry kept" "claude-haiku" "$synth_breakdown"
@@ -161,7 +175,7 @@ assert_contains     "real haiku entry kept" "claude-haiku" "$synth_breakdown"
 echo ""
 echo "=== End-to-end render ==="
 
-echo "--- Test 11: Σ line appears when MODEL_BREAKDOWN is pre-populated"
+echo "--- Test 13: Σ line appears when MODEL_BREAKDOWN is pre-populated"
 SID="test-e2e-$$"
 SDIR="/tmp/claude_session_${SID}"
 mkdir -p "$SDIR"

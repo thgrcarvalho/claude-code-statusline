@@ -148,6 +148,28 @@ if [ "$ctx_pct" -lt 50 ]; then ctx_color=$GREEN
 elif [ "$ctx_pct" -lt 80 ]; then ctx_color=$YELLOW
 else ctx_color=$RED; fi
 
+# Post-/compact: harness resets used_percentage to 0, but the JSONL records the
+# real surviving context size in compact_boundary.compactMetadata.postTokens.
+ctx_post=""
+if [ "$ctx_pct" = "0" ] && [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+  ctx_post=$(grep '"subtype":"compact_boundary"' "$transcript_path" 2>/dev/null \
+    | tail -1 \
+    | grep -oE '"postTokens"[[:space:]]*:[[:space:]]*[0-9]+' \
+    | grep -oE '[0-9]+$')
+fi
+
+if [ -n "$ctx_post" ] && [ "$ctx_post" -gt 0 ]; then
+  ctx_pct_calc=$(awk -v p="$ctx_post" -v w="${ctx_kb}000" 'BEGIN {
+    if (w > 0) printf "%d", (p * 100) / w; else printf "0"
+  }')
+  if [ "$ctx_pct_calc" -lt 50 ]; then ctx_color=$GREEN
+  elif [ "$ctx_pct_calc" -lt 80 ]; then ctx_color=$YELLOW
+  else ctx_color=$RED; fi
+  ctx_str="ctx ${ctx_color}${ctx_pct_calc}%${RESET}${DIM}/${ctx_kb}k${RESET}"
+else
+  ctx_str="ctx ${ctx_color}${ctx_pct}%${RESET}${DIM}/${ctx_kb}k${RESET}"
+fi
+
 if [ "$cache_pct" -gt 80 ]; then hit_color=$GREEN
 elif [ "$cache_pct" -gt 40 ]; then hit_color=$YELLOW
 else hit_color=$RED; fi
@@ -264,7 +286,7 @@ sep="${DIM} │ ${RESET}"
 # Line 1: current turn
 printf "%s%s%s%s" \
   "${BOLD}${CYAN}${model}${RESET}" "${sep}" \
-  "ctx ${ctx_color}${ctx_pct}%${RESET}${DIM}/${ctx_kb}k${RESET}" "${sep}"
+  "${ctx_str}" "${sep}"
 printf "%s%s" "$cost_display" "${sep}"
 printf "↑${WHITE}%s${RESET} ${GREEN}+%sr${RESET} ${YELLOW}+%sw${RESET} ↓${BLUE}%s${RESET}" \
   "$(fmt_tok $tok_fresh)" "$(fmt_tok $tok_cr)" "$(fmt_tok $tok_cw)" "$(fmt_tok $tok_out)"
