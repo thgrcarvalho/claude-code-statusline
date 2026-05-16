@@ -139,6 +139,12 @@ out=$(printf '{"session_id":"test-fresh","context_window":{"used_percentage":0,"
 assert_contains     "fresh shows 0%"         "ctx 0%"  "$out"
 assert_not_contains "fresh no compact-pct"   "ctx 7%"  "$out"
 
+echo "--- Test 7b: float used_percentage rounds to integer"
+out=$(printf '{"session_id":"test-float","context_window":{"used_percentage":56.99999999999999,"context_window_size":1000000}}' \
+        | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains     "rounded to 57%"         "ctx 57%"             "$out"
+assert_not_contains "no raw float"           "56.99999999999999"   "$out"
+
 # ─── JSONL aggregation tests ──────────────────────────────────────────────────
 echo ""
 echo "=== JSONL aggregation ==="

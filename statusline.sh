@@ -41,6 +41,7 @@ transcript_path=$(_str transcript_path)
 
 model="${model:-?}"
 ctx_pct="${ctx_pct:-0}"
+ctx_pct=$(echo "$ctx_pct" | awk '{printf "%d", $1 + 0.5}')
 ctx_kb="${ctx_kb:-0}"
 cost="${cost:-0}"
 tok_fresh="${tok_fresh:-0}"
