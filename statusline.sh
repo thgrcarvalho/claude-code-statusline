@@ -41,7 +41,6 @@ transcript_path=$(_str transcript_path)
 
 model="${model:-?}"
 ctx_pct="${ctx_pct:-0}"
-ctx_pct=$(echo "$ctx_pct" | awk '{printf "%d", $1 + 0.5}')
 ctx_kb="${ctx_kb:-0}"
 cost="${cost:-0}"
 tok_fresh="${tok_fresh:-0}"
@@ -49,6 +48,13 @@ tok_cr="${tok_cr:-0}"
 tok_cw="${tok_cw:-0}"
 tok_out="${tok_out:-0}"
 session_id="${session_id:-default}"
+
+# Fresh session: harness used_percentage is stale until the first API call.
+# When all current_usage tokens are 0, no turn has completed — treat as 0.
+if [ "$tok_out" = "0" ] && [ "$tok_fresh" = "0" ] && [ "$tok_cr" = "0" ]; then
+  ctx_pct=0
+fi
+ctx_pct=$(echo "$ctx_pct" | awk '{printf "%d", $1 + 0.5}')
 
 # Derive a friendly display name from an API model ID.
 # Handles all current and future Claude models without hardcoding versions.
