@@ -359,6 +359,41 @@ _stdin24=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id
 out24=$(echo "$_stdin24" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
 assert_contains "no compact: 3k+5k = 8.0k both summed" "(8.0k)" "$(echo "$out24" | head -1)"
 
+# ─── Per-model TTL timer ─────────────────────────────────────────────────────
+echo ""
+echo "=== Per-model TTL timer ==="
+
+echo "--- Test 25: stale Sonnet cache — timer uses last Sonnet entry, not last Opus entry"
+SID25="test-model-timer-$$"
+SDIR25="/tmp/claude_session_${SID25}"
+mkdir -p "$SDIR25"
+_now25=$(date +%s)
+# Opus called 10s ago; Sonnet called 600s ago (10 min) — 5m cache expired, 1h has ~50min left
+echo "$((_now25 - 10))  1000 50000 claude-opus-4-7"    > "$SDIR25/cache_log.txt"
+echo "$((_now25 - 600)) 0 80000 claude-sonnet-4-6"    >> "$SDIR25/cache_log.txt"
+# Active model = Sonnet 4.6; prev_ts = now (so global timer would show ~5m fresh)
+_stdin25=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-sonnet-4-6","display_name":"Sonnet 4.6","provider":"anthropic"},"context_window":{"used_percentage":6,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":50}}' "$SID25")
+# Prime LAST_STATE so prev_ts = now (fresh global), confirming timer is NOT using it for Sonnet
+echo "50:${_now25}" > "$SDIR25/last_api.ts"
+out25=$(echo "$_stdin25" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+# If timer used Opus (last 10s): 1h countdown ~59:50. Sonnet (600s ago): ~50:00.
+# Assert ~50min range (0:49: or 0:50:) and NOT the Opus-based 59min.
+assert_not_contains "Sonnet 1h not using Opus timer (59min)" "0:59:" "$(echo "$out25" | head -1)"
+assert_contains     "Sonnet 80k 1h annotation shown"          "(80k)" "$(echo "$out25" | head -1)"
+
+echo "--- Test 26: active model has no cache_log entries — falls back to prev_ts (no crash)"
+SID26="test-model-fallback-$$"
+SDIR26="/tmp/claude_session_${SID26}"
+mkdir -p "$SDIR26"
+_now26=$(date +%s)
+# cache_log has only Sonnet; active model = Opus → no match → model_last_ts=0 → use prev_ts
+echo "$((_now26 - 30)) 1000 0 claude-sonnet-4-6" > "$SDIR26/cache_log.txt"
+echo "0:${_now26}" > "$SDIR26/last_api.ts"
+_stdin26=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":6,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}' "$SID26")
+out26=$(echo "$_stdin26" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+# When tok_out=0 no new turn, prev_ts read from last_api.ts (set to now → ~5:00 remaining)
+assert_contains "fallback timer renders without crash" "ttl" "$(echo "$out26" | head -1)"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="

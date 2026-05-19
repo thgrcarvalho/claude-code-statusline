@@ -340,7 +340,7 @@ case "$model" in
   Haiku*)  _cache_filter="claude-haiku" ;;
   *)       _cache_filter="$model_id" ;;  # best effort for unknown display names
 esac
-alive_cw5m=0; alive_cw1h=0
+alive_cw5m=0; alive_cw1h=0; model_last_ts=0
 if [ -f "${STATE_DIR}/cache_log.txt" ]; then
   while IFS=' ' read -r _ts _5 _1 _m; do
     # Skip entries from a different model; skip old 3-column entries (no model tag)
@@ -351,13 +351,20 @@ if [ -f "${STATE_DIR}/cache_log.txt" ]; then
       "${_cache_filter}"*) ;;
       *) continue ;;
     esac
+    [ "$_ts" -gt "$model_last_ts" ] && model_last_ts=$_ts
     [ "${_5:-0}" -gt 0 ] && [ "$((_ts + 300 - now))" -gt 0 ] && alive_cw5m=$((alive_cw5m + _5))
     [ "${_1:-0}" -gt 0 ] && [ "$((_ts + 3600 - now))" -gt 0 ] && alive_cw1h=$((alive_cw1h + _1))
   done < "${STATE_DIR}/cache_log.txt"
 fi
 
+# Per-model TTL: base the countdown on the last cache_log entry for the active model so
+# switching models shows the correct elapsed time for that model's cache, not a global one.
+# Falls back to prev_ts (most recent overall API call) when the model has no log entries yet.
+ttl_base_ts=$model_last_ts
+[ "$ttl_base_ts" -eq 0 ] && ttl_base_ts=$prev_ts
+
 # TTL countdown — 5m tier
-elapsed=$((now - prev_ts))
+elapsed=$((now - ttl_base_ts))
 remaining=$((300 - elapsed))
 cache_color=$GREEN
 if [ "$remaining" -le 0 ]; then
