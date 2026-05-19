@@ -29,6 +29,7 @@ _snum() {
 }
 
 model=$(         _sstr model           display_name)
+model_id=$(      _sstr model           id)
 ctx_pct=$(       _snum context_window  used_percentage)
 ctx_kb=$(        _snum context_window  context_window_size | awk '{printf "%d", $1/1000}')
 cost=$(          _snum cost            total_cost_usd)
@@ -239,35 +240,91 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
   if (match($0, /"cache_read_input_tokens":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"cache_read_input_tokens":/, "", f); cr = f+0 }
 
-  cw5m = 0
+  cw5m = 0; cw1h = 0
   if (match($0, /"ephemeral_5m_input_tokens":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"ephemeral_5m_input_tokens":/, "", f); cw5m = f+0 }
-
-  cw1h = 0
   if (match($0, /"ephemeral_1h_input_tokens":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"ephemeral_1h_input_tokens":/, "", f); cw1h = f+0 }
-  if (cw1h == 0 && match($0, /"cache_creation_input_tokens":[0-9]+/))
+  if (cw5m == 0 && cw1h == 0 && match($0, /"cache_creation_input_tokens":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"cache_creation_input_tokens":/, "", f); cw1h = f+0 }
+
+  web = 0; fetch = 0
+  if (match($0, /"web_search_requests":[0-9]+/))
+    { f = substr($0, RSTART, RLENGTH); sub(/"web_search_requests":/, "", f); web = f+0 }
+  if (match($0, /"web_fetch_requests":[0-9]+/))
+    { f = substr($0, RSTART, RLENGTH); sub(/"web_fetch_requests":/, "", f); fetch = f+0 }
 
   out = 0
   if (match($0, /"output_tokens":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"output_tokens":/, "", f); out = f+0 }
 
+  # Skip streaming checkpoints: Claude Code writes the same API response to the JSONL
+  # multiple times (different UUIDs) as it streams. Consecutive entries sharing the same
+  # (model, input_tokens, output_tokens) fingerprint are duplicates — count only the first.
+  fingerprint = model ":" in_tok ":" out
+  if (fingerprint == prev_fingerprint) next
+  prev_fingerprint = fingerprint
+
   in_sum[model] += in_tok; cr_sum[model] += cr
   cw5m_sum[model] += cw5m; cw1h_sum[model] += cw1h
   out_sum[model] += out
+  web_sum[model] += web; fetch_sum[model] += fetch
 }
 END {
   for (m in in_sum)
-    print m, in_sum[m], cr_sum[m], cw5m_sum[m], cw1h_sum[m], out_sum[m]
+    print m, in_sum[m], cr_sum[m], cw5m_sum[m], cw1h_sum[m], out_sum[m], web_sum[m], fetch_sum[m]
 }
 ' "${jsonl_files[@]}" > "${MODEL_BREAKDOWN}.tmp" 2>/dev/null && \
       mv "${MODEL_BREAKDOWN}.tmp" "$MODEL_BREAKDOWN") &
   fi
   [ -x "${HOME}/.claude/refresh-pricing.sh" ] && "${HOME}/.claude/refresh-pricing.sh" &
+
+  # Record this turn's 5m/1h cache writes in cache_log for alive-cache TTL tracking.
+  # Format per line: "<unix_ts> <cw5m> <cw1h> <model_id>". Entries older than 1h are pruned.
+  # Each model (Opus, Sonnet, etc.) has a separate cache at Anthropic; we tag entries
+  # with the model so that alive sums are filtered to the currently active model only.
+  turn_cw5m=0; turn_cw1h=0; turn_model_id="${model_id:-unknown}"
+  if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+    _last=$(grep '"role":"assistant"' "$transcript_path" 2>/dev/null | grep '"usage"' | tail -1)
+    if echo "$_last" | grep -qF '"ephemeral_5m_input_tokens"' 2>/dev/null; then
+      _v=$(echo "$_last" | grep -oE '"ephemeral_5m_input_tokens":[0-9]+' | head -1)
+      turn_cw5m=${_v##*:}; turn_cw5m=${turn_cw5m:-0}
+    fi
+    if echo "$_last" | grep -qF '"ephemeral_1h_input_tokens"' 2>/dev/null; then
+      _v=$(echo "$_last" | grep -oE '"ephemeral_1h_input_tokens":[0-9]+' | head -1)
+      turn_cw1h=${_v##*:}; turn_cw1h=${turn_cw1h:-0}
+    fi
+    _m=$(echo "$_last" | grep -oE '"model":"claude-[^"]*"' | head -1 | grep -oE 'claude-[^"]+')
+    [ -n "$_m" ] && turn_model_id="$_m"
+  fi
+  {
+    while IFS=' ' read -r _ts _5 _1 _m; do
+      [ "$((_ts + 3600 - now))" -gt 0 ] && echo "$_ts $_5 $_1 $_m"
+    done < "${STATE_DIR}/cache_log.txt" 2>/dev/null
+    echo "${now} ${turn_cw5m} ${turn_cw1h} ${turn_model_id}"
+  } > "${STATE_DIR}/cache_log.txt.tmp" 2>/dev/null && \
+    mv "${STATE_DIR}/cache_log.txt.tmp" "${STATE_DIR}/cache_log.txt" 2>/dev/null
 fi
 
-# TTL countdown
+# Sum cache writes still within their TTL window, filtered to the active model.
+# Opus and Sonnet maintain separate caches at Anthropic; mixing them would mislead.
+# JSONL model IDs may carry a date suffix (e.g. claude-haiku-4-5-20251001) while the
+# harness uses the base ID — use prefix match so both forms resolve correctly.
+alive_cw5m=0; alive_cw1h=0
+if [ -f "${STATE_DIR}/cache_log.txt" ]; then
+  while IFS=' ' read -r _ts _5 _1 _m; do
+    # Skip entries from a different model; skip old 3-column entries (no model tag)
+    [ -z "$_m" ] && continue
+    case "$_m" in
+      "${model_id}"*) ;;   # exact match or JSONL date-suffix variant
+      *) continue ;;
+    esac
+    [ "${_5:-0}" -gt 0 ] && [ "$((_ts + 300 - now))" -gt 0 ] && alive_cw5m=$((alive_cw5m + _5))
+    [ "${_1:-0}" -gt 0 ] && [ "$((_ts + 3600 - now))" -gt 0 ] && alive_cw1h=$((alive_cw1h + _1))
+  done < "${STATE_DIR}/cache_log.txt"
+fi
+
+# TTL countdown — 5m tier
 elapsed=$((now - prev_ts))
 remaining=$((300 - elapsed))
 cache_color=$GREEN
@@ -280,10 +337,41 @@ else
   elif [ "$remaining" -lt 120 ]; then cache_color=$YELLOW; fi
 fi
 
-# Session total from per-model Σ breakdown (written at end of each render)
-session_cost_val=$(cat "$SESSION_COST" 2>/dev/null | tr -d '[:space:]')
-if [ -n "$session_cost_val" ]; then
-  cost_display="${YELLOW}$(fmt_c "$session_cost_val")${RESET}"
+# TTL countdown — 1h tier (same timestamp base; shown only when split data available)
+remaining_1h=$((3600 - elapsed))
+cache_1h_color=$GREEN
+if [ "$remaining_1h" -le 0 ]; then
+  cache_1h_timer="expired"; cache_1h_color=$RED
+else
+  h=$((remaining_1h / 3600)); m=$(( (remaining_1h % 3600) / 60 )); s=$((remaining_1h % 60))
+  cache_1h_timer=$(printf "%d:%02d:%02d" "$h" "$m" "$s")
+  if [ "$remaining_1h" -lt 600 ]; then cache_1h_color=$RED
+  elif [ "$remaining_1h" -lt 1200 ]; then cache_1h_color=$YELLOW; fi
+fi
+
+# Build TTL display: alive sums per tier when available, plain countdown otherwise
+if [ "$alive_cw5m" -gt 0 ] && [ "$alive_cw1h" -gt 0 ]; then
+  cache_timer_display="${cache_color}${cache_timer}($(fmt_tok $alive_cw5m))${RESET}${DIM} / ${RESET}${cache_1h_color}${cache_1h_timer}($(fmt_tok $alive_cw1h))${RESET}"
+elif [ "$alive_cw5m" -gt 0 ]; then
+  cache_timer_display="${cache_color}${cache_timer}($(fmt_tok $alive_cw5m))${RESET}"
+elif [ "$alive_cw1h" -gt 0 ]; then
+  cache_timer_display="${cache_1h_color}${cache_1h_timer}($(fmt_tok $alive_cw1h))${RESET}"
+else
+  cache_timer_display="${cache_color}${cache_timer}${RESET}"
+fi
+
+# Top-line cost: show both harness (matches /usage, excludes subagents) and local sum
+# (includes subagents, uses LiteLLM rates). Neither is the authoritative Anthropic bill.
+local_cost_val=$(cat "$SESSION_COST" 2>/dev/null | tr -d '[:space:]')
+have_harness=0; have_local=0
+[ -n "$cost" ] && awk -v v="$cost" 'BEGIN{exit !(v+0 > 0)}' 2>/dev/null && have_harness=1
+[ -n "$local_cost_val" ] && awk -v v="$local_cost_val" 'BEGIN{exit !(v+0 > 0)}' 2>/dev/null && have_local=1
+if [ $have_harness -eq 1 ] && [ $have_local -eq 1 ]; then
+  cost_display="${YELLOW}$(fmt_c "$cost")${RESET}${DIM} / ${RESET}${YELLOW}$(fmt_c "$local_cost_val")${RESET}"
+elif [ $have_harness -eq 1 ]; then
+  cost_display="${YELLOW}$(fmt_c "$cost")${RESET}"
+elif [ $have_local -eq 1 ]; then
+  cost_display="${YELLOW}$(fmt_c "$local_cost_val")${RESET}"
 else
   cost_display="${DIM}\$0.00${RESET}"
 fi
@@ -298,12 +386,17 @@ printf "%s%s" "$cost_display" "${sep}"
 printf "↑${WHITE}%s${RESET} ${GREEN}+%sr${RESET} ${YELLOW}+%sw${RESET} ↓${BLUE}%s${RESET}" \
   "$(fmt_tok $tok_fresh)" "$(fmt_tok $tok_cr)" "$(fmt_tok $tok_cw)" "$(fmt_tok $tok_out)"
 printf "%s hit ${hit_color}%s%%${RESET}" "${sep}" "$cache_pct"
-printf "%s ~ttl ${cache_color}%s${RESET}\n" "${sep}" "$cache_timer"
+printf "%s ~ttl %s\n" "${sep}" "$cache_timer_display"
 
+# NOTE: Σ rows are computed from transcript JSONLs (parent + subagents). They
+# WILL NOT match /usage's per-model rows — /usage excludes subagent activity.
+# See README "Why the two cost figures differ".
 # Lines 2+: per-model totals — read directly from flat-text breakdown (no jq needed)
+# Columns: model in cr cw5m cw1h out web fetch
 total_cost=0
 if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
-  while IFS=' ' read -r m_id m_in m_cr m_cw5m m_cw1h m_out; do
+  while IFS=' ' read -r m_id m_in m_cr m_cw5m m_cw1h m_out m_web m_fetch; do
+    m_web="${m_web:-0}"; m_fetch="${m_fetch:-0}"
     [ "$((m_in + m_cr + m_cw5m + m_cw1h + m_out))" -eq 0 ] && continue
     m_name=$(model_display "$m_id")
     read m_pin m_pout <<< "$(pricing_for "$m_id")"
@@ -311,14 +404,18 @@ if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
     m_pcw5m=$(awk -v b="$m_pin" 'BEGIN {printf "%.4f", b * 1.25}')
     m_pcw1h=$(awk -v b="$m_pin" 'BEGIN {printf "%.4f", b * 2.00}')
     m_cw_total=$((m_cw5m + m_cw1h))
-    m_cost=$(echo "$m_in $m_pin $m_cr $m_pcr $m_cw5m $m_pcw5m $m_cw1h $m_pcw1h $m_out $m_pout" | awk '{
-      printf "%.6f", ($1*$2 + $3*$4 + $5*$6 + $7*$8 + $9*$10) / 1000000
+    m_cost=$(echo "$m_in $m_pin $m_cr $m_pcr $m_cw5m $m_pcw5m $m_cw1h $m_pcw1h $m_out $m_pout $m_web $m_fetch" | awk '{
+      web_cost = ($11 + $12) * 0.010
+      printf "%.6f", ($1*$2 + $3*$4 + $5*$6 + $7*$8 + $9*$10) / 1000000 + web_cost
     }')
     total_cost=$(awk -v a="$total_cost" -v b="$m_cost" 'BEGIN {printf "%.6f", a+b}')
-    printf "${DIM}Σ ${CYAN}%s${RESET}${DIM}: ↑%s +%sr +%sw ↓%s = ${YELLOW}%s${RESET}\n" \
+    ws_suffix=""
+    [ "$m_web" -gt 0 ] 2>/dev/null && ws_suffix=" ${DIM}+${m_web}ws${RESET}"
+    printf "${DIM}Σ ${CYAN}%s${RESET}${DIM}: ↑%s +%sr +%sw ↓%s = ${YELLOW}%s${RESET}%s\n" \
       "$m_name" \
       "$(fmt_tok $m_in)" "$(fmt_tok $m_cr)" "$(fmt_tok $m_cw_total)" "$(fmt_tok $m_out)" \
-      "$(fmt_c $m_cost)"
+      "$(fmt_c $m_cost)" "$ws_suffix"
   done < "$MODEL_BREAKDOWN"
+  # Write local sum as fallback for when harness omits cost.total_cost_usd
   echo "$total_cost" > "$SESSION_COST"
 fi

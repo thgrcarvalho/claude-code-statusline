@@ -1,0 +1,1 @@
+{"type":"assistant","uuid":"uuid-dual-ttl","message":{"role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":10,"cache_read_input_tokens":5000,"cache_creation_input_tokens":3000,"output_tokens":80,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2000}}}}

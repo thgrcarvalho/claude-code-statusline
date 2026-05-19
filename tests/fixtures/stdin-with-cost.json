@@ -1,0 +1,1 @@
+{"session_id":"test-harness-cost","transcript_path":"/dev/null","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":5,"context_window_size":1000000},"cost":{"total_cost_usd":0.42},"current_usage":{"input_tokens":10,"cache_read_input_tokens":5000,"cache_creation_input_tokens":0,"output_tokens":50}}

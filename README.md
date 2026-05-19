@@ -8,26 +8,28 @@ A feature-rich status line for [Claude Code](https://claude.ai/code) that shows 
 
 **Line 1 — current turn:**
 ```
-Opus 4.7 │ ctx 14%/200k │ $0.42 │ ↑1 +87kr +2kw ↓312 │ hit 97% │ ~ttl 4:12
+Opus 4.7 │ ctx 14%/200k │ $0.42 / $0.65 │ ↑1 +87kr +2kw ↓312 │ hit 97% │ ~ttl 4:12(1.0k) / 0:59:01(80kw)
 ```
 
 **Line 2+ — per-model session totals (including sub-agents):**
 ```
 Σ Opus 4.7:   ↑12 +1.4Mr +80kw ↓7k = $0.38
-Σ Sonnet 4.6: ↑8  +210kr +30kw ↓3k = $0.04
+Σ Sonnet 4.6: ↑8  +210kr +30kw ↓3k = $0.27
 ```
 
 | Field | Meaning |
 |---|---|
 | `ctx 14%/200k` | Context window usage (color: green < 50%, yellow < 80%, red ≥ 80%) |
-| `$0.42` | Session cost — sum of Σ per-model rows |
+| `$0.42 / $0.65` | Session cost: `$<harness>` (matches `/usage`, excludes sub-agents) `/` `$<local>` (includes sub-agents, uses LiteLLM rates) — see *Why the two cost figures differ* |
 | `↑N` | Fresh (uncached) input tokens this turn — almost always 1–6 |
 | `+Xr` | Cache read tokens (billed at 10% of base price) |
-| `+Xw` | Cache write tokens (billed at 125–200% of base price) |
+| `+Xw` | Cache write tokens total this turn (billed at 125–200% of base price) |
 | `↓N` | Output tokens generated |
 | `hit X%` | `cache_read / (fresh + read + write)` for this turn |
-| `~ttl X:XX` | Time until prompt cache *may* expire (~5-min floor, resets on each API call) |
-| `Σ model: ...` | Cumulative token totals + cost per model, including all sub-agents |
+| `~ttl M:SS(Xkw)` | 5m-tier countdown + total still-alive 5m cache writes across recent turns — if this hits 0 those tokens will be re-written (expensive) on the next call |
+| `/ H:MM:SS(Ykw)` | 1h-tier countdown + total still-alive 1h cache writes — same stakes, longer window |
+| `+Nws` | Web-search requests this model made, billed at $10 / 1k |
+| `Σ model: ...` | Cumulative token totals + cost per model, from transcript JSONLs including sub-agents |
 
 ---
 
@@ -124,9 +126,44 @@ If you've run the installer more than once, `uninstall.sh` lists all available b
 
 The statusline script is invoked by Claude Code every second via `refreshInterval: 1`. It receives a JSON blob on stdin with the current session state and prints the status lines.
 
-**Σ per-model rows** are computed by parsing the session's JSONL transcript (plus any sub-agent JSONL files in the same directory) on each new API response. The breakdown is written to `/tmp/claude_session_<id>/model_breakdown.json` and read back on subsequent renders.
+**Top-line cost** shows two figures: `$<harness>` is read directly from Claude Code's `cost.total_cost_usd` field and matches `/usage`'s "Total cost" exactly. `$<local>` is the sum of the Σ per-model rows and includes sub-agent activity that `/usage` omits. When only one is available, just that value is shown. Neither figure equals the authoritative Anthropic Console bill.
 
-**Pricing** is fetched from LiteLLM's community-maintained `model_prices_and_context_window.json` at most once per 24 hours and cached in `/tmp/claude_pricing.json`. Cache read/write rates follow Anthropic's standard ratios (read = 10%, write_5m = 125%, write_1h = 200% of the base input price) derived at runtime — only the base input and output rates are stored.
+**TTL countdown** shows `M:SS(Xkw) / H:MM:SS(Ykw)` where `Xkw` / `Ykw` are the total tokens still alive in each cache tier across all turns in the session — not just the last turn. The script maintains a per-turn log (`cache_log.txt`) and sums only entries that haven't expired yet. When cache expires, those tokens get re-written at the expensive rate on the next API call; the timer tells you how long you have before that happens. Both countdowns share the timestamp of the last API call.
+
+**Context % per model:** When using a multi-model setting (e.g., `/model opusplan`), the `ctx N%` figure changes as the active model switches. Each model has its own cached state; Claude Code computes `used_percentage` relative to the active model's view of the conversation, so the percentage legitimately differs between models. This is expected.
+
+**Σ per-model rows** are computed by parsing the session's JSONL transcript (plus any sub-agent JSONL files in the same directory) on each new API response. The breakdown is written to `/tmp/claude_session_<id>/model_breakdown.txt` and read back on subsequent renders.
+
+**Pricing** is fetched from LiteLLM's community-maintained `model_prices_and_context_window.json` at most once per 24 hours and cached in `/tmp/claude_pricing.txt`. Cache read/write rates follow Anthropic's standard ratios (read = 10%, write_5m = 125%, write_1h = 200% of the base input price) derived at runtime — only the base input and output rates are stored.
+
+---
+
+## FAQ
+
+**Why does Sonnet appear during plan mode with `/model opusplan`?**
+opusplan should route to Opus during plan mode (Shift+Tab) and to Sonnet for execution. When Sonnet appears during plan mode, it indicates a known routing bug ([#16982](https://github.com/anthropics/claude-code/issues/16982), [#35927](https://github.com/anthropics/claude-code/issues/35927)) where opusplan intermittently fails to switch back to Opus. **The statusline is correctly reporting the actual model used** — it's your canary that the bug has triggered.
+
+Workarounds:
+- Persist the setting in `~/.claude/settings.json` with `"model": "opusplan"` (setting it only in-session via `/model opusplan` can cause the routing to break mid-session)
+- Manually run `/model opus` when entering plan mode if Sonnet is shown
+- Use `/advisor` as an alternative that keeps Opus available on-demand
+
+Note: even when opusplan works correctly, plan-mode Opus turns use the **200K** context window — not 1M — regardless of your context setting.
+
+---
+
+## Why the two cost figures differ
+
+The top-line shows `$<harness> / $<local>`:
+
+| Surface | Includes | Misses |
+|---|---|---|
+| `$<harness>` (= `/usage` "Total cost") | Parent conversation API calls, internal Haiku usage (title generation, summarization, plan-mode classifier) | **Sub-agent activity** ([#22625](https://github.com/anthropics/claude-code/issues/22625), [#10388](https://github.com/anthropics/claude-code/issues/10388)) |
+| `$<local>` (= sum of Σ rows) | Parent conversation + every sub-agent JSONL on disk | Internal Haiku calls that bypass transcript files |
+
+If `$<local>` is much higher than `$<harness>`, that gap is your sub-agents' cost.
+
+Neither figure is the definitive Anthropic bill — for that, check the [Anthropic Console](https://console.anthropic.com/) dashboard. This divergence is a known gap in Claude Code's `/usage` tracking, tracked upstream in the issues linked above.
 
 ---
 
@@ -149,7 +186,7 @@ All configuration is in `statusline.sh`. Common knobs:
 ./tests/test.sh
 ```
 
-Runs 22 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard (compact JSON with an early numeric field that previously caused all extractions to return the same wrong value), multiple `display_name` ambiguity, JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`), and an end-to-end render with Σ lines.
+Runs 53 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard, multiple `display_name` ambiguity, JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`, cache-write double-count regression, web-search counter propagation), dual-cost top-line display (harness + local, fallback cases), dual-TTL display with 5m/1h token-count annotations, and an end-to-end render with Σ lines.
 
 CI runs automatically on every push and pull request via GitHub Actions (no extra dependencies — `jq` is intentionally absent to verify the no-jq path).
 
