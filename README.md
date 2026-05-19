@@ -8,7 +8,7 @@ A feature-rich status line for [Claude Code](https://claude.ai/code) that shows 
 
 **Line 1 — current turn:**
 ```
-Opus 4.7 │ ctx 14%/200k │ $0.42 / $0.65 │ ↑1 +87kr +2kw ↓312 │ hit 97% │ ~ttl 4:12(1.0k) / 0:59:01(80kw)
+Opus 4.7 │ ctx 14%/200k │ $0.42 / $0.65 │ ↑1 +87kr +2kw ↓312 │ hit 97% │ ~ttl 0:59:01(89k)
 ```
 
 **Line 2+ — per-model session totals (including sub-agents):**
@@ -26,8 +26,7 @@ Opus 4.7 │ ctx 14%/200k │ $0.42 / $0.65 │ ↑1 +87kr +2kw ↓312 │ hit 9
 | `+Xw` | Cache write tokens total this turn (billed at 125–200% of base price) |
 | `↓N` | Output tokens generated |
 | `hit X%` | `cache_read / (fresh + read + write)` for this turn |
-| `~ttl M:SS(Xkw)` | 5m-tier countdown + total still-alive 5m cache writes across recent turns — if this hits 0 those tokens will be re-written (expensive) on the next call |
-| `/ H:MM:SS(Ykw)` | 1h-tier countdown + total still-alive 1h cache writes — same stakes, longer window |
+| `~ttl T(Xk)` | Countdown until the cached portion of your current context expires + how many tokens of the current context are cached (`cache_read + cache_write` of this call). Uses 1h-tier countdown when last cache write went to the 1h tier, 5m-tier otherwise. Timer is per-model — switching models shows the correct remaining TTL for that model's cache. |
 | `+Nws` | Web-search requests this model made, billed at $10 / 1k |
 | `Σ model: ...` | Cumulative token totals + cost per model, from transcript JSONLs including sub-agents |
 
@@ -128,7 +127,7 @@ The statusline script is invoked by Claude Code every second via `refreshInterva
 
 **Top-line cost** shows two figures: `$<harness>` is read directly from Claude Code's `cost.total_cost_usd` field and matches `/usage`'s "Total cost" exactly. `$<local>` is the sum of the Σ per-model rows and includes sub-agent activity that `/usage` omits. When only one is available, just that value is shown. Neither figure equals the authoritative Anthropic Console bill.
 
-**TTL countdown** shows `M:SS(Xkw) / H:MM:SS(Ykw)` where `Xkw` / `Ykw` are the total tokens still alive in each cache tier across all turns in the session — not just the last turn. The script maintains a per-turn log (`cache_log.txt`) and sums only entries that haven't expired yet. When cache expires, those tokens get re-written at the expensive rate on the next API call; the timer tells you how long you have before that happens. The countdown is **per-model**: it tracks time since the active model's last API call, so when switching models (e.g., opusplan toggling between Opus and Sonnet) the timer immediately reflects the elapsed time for that model's cache — if Sonnet hasn't been called in 10 minutes, its 1h timer shows ~50 min remaining. After `/compact`, entries that predate the compact boundary are dropped from the sum — `/compact` rewrites conversation history, which invalidates Anthropic's prompt cache for those tokens.
+**TTL countdown** shows `T(Xk)` where `T` is the remaining TTL and `Xk` is how much of the current context is cached. Specifically, `Xk = cache_read + cache_write` from the active model's most recent API call — this matches `ctx N%` size closely, because those two fields together cover the cached portion of the conversation sent to the API. The timer uses the **1h-tier countdown** when the most recent cache write went to the 1h cache tier (common in Claude Code), otherwise the 5m-tier countdown. The countdown is **per-model**: it tracks the last API call to the active model, so when switching models (e.g., opusplan toggling between Opus and Sonnet), the timer immediately reflects how long ago that model was last called. After `/compact`, cache_log entries older than the compact boundary are excluded — `/compact` rewrites conversation history and invalidates the prompt cache.
 
 **Context % per model:** When using a multi-model setting (e.g., `/model opusplan`), the `ctx N%` figure changes as the active model switches. Each model has its own cached state; Claude Code computes `used_percentage` relative to the active model's view of the conversation, so the percentage legitimately differs between models. This is expected.
 
@@ -186,7 +185,7 @@ All configuration is in `statusline.sh`. Common knobs:
 ./tests/test.sh
 ```
 
-Runs 59 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard, multiple `display_name` ambiguity, JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`, cache-write double-count regression, web-search counter propagation), dual-cost top-line display (harness + local, fallback cases), dual-TTL display with 5m/1h token-count annotations, compact_boundary cache_log floor (pre-compact entries excluded), and an end-to-end render with Σ lines.
+Runs 55 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard, multiple `display_name` ambiguity, JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`, cache-write double-count regression, web-search counter propagation), dual-cost top-line display (harness + local, fallback cases), dual-TTL display with 5m/1h token-count annotations, compact_boundary cache_log floor (pre-compact entries excluded), and an end-to-end render with Σ lines.
 
 CI runs automatically on every push and pull request via GitHub Actions (no extra dependencies — `jq` is intentionally absent to verify the no-jq path).
 

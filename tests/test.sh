@@ -271,63 +271,76 @@ assert_not_contains 'no slash when harness absent' '/ $'  "$(echo "$out18" | hea
 echo ""
 echo "=== Dual-TTL display ==="
 
-echo "--- Test 19: cache_log alive sums shown in TTL (both tiers, model-filtered)"
-SID19="test-ttl-alive-$$"
+echo "--- Test 19: annotation shows tok_cr+tok_cw from harness (not cache_log sums)"
+# stdin-compact.json has cache_read=87000, cache_write=2000 → cached_now=89000 → "(89k)"
+# cache_log has a 1h-tier entry → model_last_is_1h=1 → shows H:MM:SS timer
+# Suppress new-turn by pre-populating last_api.ts with tok_out=312 (matches stdin-compact)
+SID19="test-ttl-anno-$$"
 SDIR19="/tmp/claude_session_${SID19}"
 mkdir -p "$SDIR19"
 _now19=$(date +%s)
-# stdin-compact.json has model id "claude-opus-4-7"; tag entries with that model
-echo "$((_now19 - 10)) 1000 2000 claude-opus-4-7" > "$SDIR19/cache_log.txt"
+echo "312:${_now19}" > "$SDIR19/last_api.ts"
+echo "$((_now19 - 30)) 0 50000 claude-opus-4-7" > "$SDIR19/cache_log.txt"
 out19=$(sed "s/test-compact/${SID19}/" "$FIXTURES/stdin-compact.json" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
-assert_contains "TTL shows alive 5m (1.0k)"   "(1.0k)" "$(echo "$out19" | head -1)"
-assert_contains "TTL shows alive 1h (2.0k)"   "(2.0k)" "$(echo "$out19" | head -1)"
-assert_contains "1h countdown H:MM:SS format" "0:"     "$(echo "$out19" | head -1)"
+assert_contains "annotation = tok_cr+tok_cw (89k)" "(89k)" "$(echo "$out19" | head -1)"
+assert_contains "1h tier → H:MM:SS format"         "0:"    "$(echo "$out19" | head -1)"
 
-echo "--- Test 20: no cache_log -> plain ttl (no parens)"
-out20=$(cat "$FIXTURES/stdin-compact.json" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+echo "--- Test 20: no cache activity → no annotation parens"
+SID20="test-ttl-nocache-$$"
+SDIR20="/tmp/claude_session_${SID20}"
+mkdir -p "$SDIR20"
+_stdin20=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":5,"context_window_size":1000000},"current_usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}' "$SID20")
+out20=$(echo "$_stdin20" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
 ttl_field20=$(echo "$out20" | head -1 | grep -oE '~ttl [^ ]+' | head -1)
-assert_not_contains "plain ttl has no parens"  "(" "$ttl_field20"
-assert_not_contains "plain ttl has no slash"   "/" "$ttl_field20"
+assert_not_contains "no cache data: no annotation" "(" "$ttl_field20"
 
-# ─── Alive-cache TTL tracking ─────────────────────────────────────────────────
+# ─── Cache annotation and timer tier ──────────────────────────────────────────
 echo ""
-echo "=== Alive-cache TTL tracking ==="
+echo "=== Cache annotation and timer tier ==="
 
-echo "--- Test 21: two fresh entries for same model, both tiers summed correctly"
-SID21="test-cache-alive-$$"
+echo "--- Test 21: annotation = tok_cr+tok_cw from stdin, cache_log values ignored"
+SID21="test-ttl-value-$$"
 SDIR21="/tmp/claude_session_${SID21}"
 mkdir -p "$SDIR21"
 _now21=$(date +%s)
-echo "$((_now21 - 10)) 5000 100000 claude-opus-4-7"  > "$SDIR21/cache_log.txt"
-echo "$((_now21 - 290)) 2000 0 claude-opus-4-7"     >> "$SDIR21/cache_log.txt"
-out21=$(sed "s/test-compact/${SID21}/" "$FIXTURES/stdin-compact.json" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
-assert_contains "alive 5m sums 5k+2k = 7.0k" "(7.0k)"  "$(echo "$out21" | head -1)"
-assert_contains "alive 1h = 100k"             "(100k)"  "$(echo "$out21" | head -1)"
+# stdin: tok_cr=5000, tok_cw=2000 → cached_now=7000 → "(7.0k)"
+_stdin21=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":5,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":5000,"cache_creation_input_tokens":2000,"output_tokens":50}}' "$SID21")
+echo "50:${_now21}" > "$SDIR21/last_api.ts"
+# cache_log has 200k in it — should NOT appear in annotation
+echo "$((_now21 - 10)) 0 200000 claude-opus-4-7" > "$SDIR21/cache_log.txt"
+out21=$(echo "$_stdin21" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains     "annotation = 5k+2k = 7.0k"        "(7.0k)"  "$(echo "$out21" | head -1)"
+assert_not_contains "cache_log 200k not in annotation"  "(200k)"  "$(echo "$out21" | head -1)"
 
-echo "--- Test 22: expired 5m excluded; alive 1h shown; different model excluded"
-SID22="test-cache-expired-$$"
+echo "--- Test 22: 1h-tier cache_log entry → H:MM:SS timer; 5m-only → M:SS timer"
+SID22="test-ttl-tier-$$"
 SDIR22="/tmp/claude_session_${SID22}"
 mkdir -p "$SDIR22"
 _now22=$(date +%s)
-echo "$((_now22 - 310)) 5000 0 claude-opus-4-7"      > "$SDIR22/cache_log.txt"   # expired 5m
-echo "$((_now22 - 100)) 0 200000 claude-opus-4-7"   >> "$SDIR22/cache_log.txt"   # alive 1h
-echo "$((_now22 - 50)) 9000 900000 claude-sonnet-4-6" >> "$SDIR22/cache_log.txt" # different model — must be excluded
-out22=$(sed "s/test-compact/${SID22}/" "$FIXTURES/stdin-compact.json" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
-assert_not_contains "expired 5m not shown"         "(5.0k)"  "$(echo "$out22" | head -1)"
-assert_not_contains "other model tokens excluded"  "(9.0k)"  "$(echo "$out22" | head -1)"
-assert_contains     "alive 1h = 200k"              "(200k)"  "$(echo "$out22" | head -1)"
+_stdin22=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":5,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":1000,"cache_creation_input_tokens":1000,"output_tokens":50}}' "$SID22")
+echo "50:${_now22}" > "$SDIR22/last_api.ts"
+# 1h-tier entry (cw1h=80000) → model_last_is_1h=1 → H:MM:SS
+echo "$((_now22 - 20)) 0 80000 claude-opus-4-7" > "$SDIR22/cache_log.txt"
+out22_1h=$(echo "$_stdin22" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "1h entry → H:MM:SS timer" "0:59:" "$(echo "$out22_1h" | head -1)"
+# 5m-only entry (cw1h=0) → model_last_is_1h=0 → M:SS
+echo "$((_now22 - 20)) 80000 0 claude-opus-4-7" > "$SDIR22/cache_log.txt"
+out22_5m=$(echo "$_stdin22" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_not_contains "5m entry → M:SS, not H:MM:SS" "0:59:" "$(echo "$out22_5m" | head -1)"
 
 # ─── compact_boundary cache_log floor ────────────────────────────────────────
 echo ""
 echo "=== compact_boundary cache_log floor ==="
 
-echo "--- Test 23: cache_log entries before most-recent compact_boundary are excluded"
+echo "--- Test 23: compact floor excludes pre-compact entry from model_last_ts"
+# Scenario: ONLY a pre-compact cache_log entry exists (no post-compact calls yet).
+# With compact floor: entry excluded → model_last_ts=0 → fallback to prev_ts=now → ~5:00 timer.
+# Without floor it would show ~2:30 (entry at now-150 → remaining=150s → 2:30).
 SID23="test-compact-floor-$$"
 SDIR23="/tmp/claude_session_${SID23}"
 mkdir -p "$SDIR23"
 _now23=$(date +%s)
-_compact_ts23=$((_now23 - 200))   # compact happened 200s ago
-# Format epoch as ISO 8601 UTC — try GNU date, fall back to BSD date
+_compact_ts23=$((_now23 - 100))  # compact 100s ago
 _compact_iso23=$(date -u -d "@${_compact_ts23}" +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || \
                   date -u -r "${_compact_ts23}" +"%Y-%m-%dT%H:%M:%S.000Z")
 _compact_fixture23="/tmp/test23-compact-$$.jsonl"
@@ -335,29 +348,30 @@ printf '{"type":"user","subtype":"compact_boundary","uuid":"uuid-compact-23","ti
   "$_compact_iso23" > "$_compact_fixture23"
 printf '{"type":"assistant","uuid":"uuid-a23","message":{"role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}\n' \
   >> "$_compact_fixture23"
-# Pre-compact entry (230s ago = 30s before compact): within 5m TTL — should be EXCLUDED by compact floor
-# Post-compact entry (60s ago = 140s after compact): within 5m TTL — should be INCLUDED
-echo "$((_now23 - 230)) 3000 0 claude-opus-4-7"   > "$SDIR23/cache_log.txt"
-echo "$((_now23 - 60))  5000 0 claude-opus-4-7"  >> "$SDIR23/cache_log.txt"
-_stdin23=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":14,"context_window_size":1000000},"current_usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":100}}' \
+# Only a pre-compact entry (now-150, 50s before compact at now-100)
+echo "$((_now23 - 150)) 0 50000 claude-opus-4-7" > "$SDIR23/cache_log.txt"
+# prev_ts = now (via last_api.ts); tok_out=100 suppresses new-turn
+echo "100:${_now23}" > "$SDIR23/last_api.ts"
+_stdin23=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":14,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":100}}' \
   "$SID23" "$_compact_fixture23")
 out23=$(echo "$_stdin23" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
-assert_not_contains "pre-compact 3k excluded"  "(3.0k)"  "$(echo "$out23" | head -1)"
-assert_contains     "post-compact 5k included" "(5.0k)"  "$(echo "$out23" | head -1)"
+# With floor: fallback timer ≈ 5:00 (fresh). Without floor it would be ~2:30.
+assert_not_contains "compact excludes pre-compact from timer (no 2:3x)" "2:3" "$(echo "$out23" | head -1)"
 rm -f "$_compact_fixture23"
 
-echo "--- Test 24: no compact_boundary in transcript — no floor, both entries summed"
-SID24="test-no-compact-$$"
+echo "--- Test 24: no compact_boundary → pre-compact entry used for model_last_ts (~57min)"
+SID24="test-no-compact-floor-$$"
 SDIR24="/tmp/claude_session_${SID24}"
 mkdir -p "$SDIR24"
 _now24=$(date +%s)
-# Same structure as Test 23 but transcript has no compact_boundary → no floor
-echo "$((_now24 - 230)) 3000 0 claude-opus-4-7"   > "$SDIR24/cache_log.txt"
-echo "$((_now24 - 60))  5000 0 claude-opus-4-7"  >> "$SDIR24/cache_log.txt"
-_stdin24=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":14,"context_window_size":1000000},"current_usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":100}}' \
+# Same 1h-tier entry at now-150 but no compact → model_last_ts=now-150, model_last_is_1h=1
+echo "$((_now24 - 150)) 0 50000 claude-opus-4-7" > "$SDIR24/cache_log.txt"
+echo "100:${_now24}" > "$SDIR24/last_api.ts"
+_stdin24=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":14,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":100}}' \
   "$SID24")
 out24=$(echo "$_stdin24" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
-assert_contains "no compact: 3k+5k = 8.0k both summed" "(8.0k)" "$(echo "$out24" | head -1)"
+# elapsed=150, remaining_1h=3450 → 0:57:30 → contains "0:5"
+assert_contains "no compact: entry used → ~57min 1h timer" "0:5" "$(echo "$out24" | head -1)"
 
 # ─── Per-model TTL timer ─────────────────────────────────────────────────────
 echo ""
@@ -371,8 +385,8 @@ _now25=$(date +%s)
 # Opus called 10s ago; Sonnet called 600s ago (10 min) — 5m cache expired, 1h has ~50min left
 echo "$((_now25 - 10))  1000 50000 claude-opus-4-7"    > "$SDIR25/cache_log.txt"
 echo "$((_now25 - 600)) 0 80000 claude-sonnet-4-6"    >> "$SDIR25/cache_log.txt"
-# Active model = Sonnet 4.6; prev_ts = now (so global timer would show ~5m fresh)
-_stdin25=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-sonnet-4-6","display_name":"Sonnet 4.6","provider":"anthropic"},"context_window":{"used_percentage":6,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":50}}' "$SID25")
+# Active model = Sonnet 4.6; tok_cr=80000 → cached_now=80000 → "(80k)" annotation
+_stdin25=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-sonnet-4-6","display_name":"Sonnet 4.6","provider":"anthropic"},"context_window":{"used_percentage":6,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":80000,"cache_creation_input_tokens":0,"output_tokens":50}}' "$SID25")
 # Prime LAST_STATE so prev_ts = now (fresh global), confirming timer is NOT using it for Sonnet
 echo "50:${_now25}" > "$SDIR25/last_api.ts"
 out25=$(echo "$_stdin25" | bash "$SCRIPT" 2>/dev/null | strip_ansi)

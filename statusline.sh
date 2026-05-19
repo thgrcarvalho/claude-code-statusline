@@ -330,8 +330,8 @@ END {
     mv "${STATE_DIR}/cache_log.txt.tmp" "${STATE_DIR}/cache_log.txt" 2>/dev/null
 fi
 
-# Sum cache writes still within their TTL window, filtered to the active model.
-# Opus and Sonnet maintain separate caches at Anthropic; mixing them would mislead.
+# Find the most recent cache_log entry for the active model.
+# Used for (a) per-model TTL timer base and (b) which TTL tier the last write used.
 # model_id may be an alias like "opusplan" rather than a real Claude model ID, so
 # derive the filter prefix from display_name ("Opus 4.7" → "claude-opus") instead.
 case "$model" in
@@ -340,7 +340,7 @@ case "$model" in
   Haiku*)  _cache_filter="claude-haiku" ;;
   *)       _cache_filter="$model_id" ;;  # best effort for unknown display names
 esac
-alive_cw5m=0; alive_cw1h=0; model_last_ts=0
+model_last_ts=0; model_last_is_1h=0
 if [ -f "${STATE_DIR}/cache_log.txt" ]; then
   while IFS=' ' read -r _ts _5 _1 _m; do
     # Skip entries from a different model; skip old 3-column entries (no model tag)
@@ -351,11 +351,18 @@ if [ -f "${STATE_DIR}/cache_log.txt" ]; then
       "${_cache_filter}"*) ;;
       *) continue ;;
     esac
-    [ "$_ts" -gt "$model_last_ts" ] && model_last_ts=$_ts
-    [ "${_5:-0}" -gt 0 ] && [ "$((_ts + 300 - now))" -gt 0 ] && alive_cw5m=$((alive_cw5m + _5))
-    [ "${_1:-0}" -gt 0 ] && [ "$((_ts + 3600 - now))" -gt 0 ] && alive_cw1h=$((alive_cw1h + _1))
+    if [ "$_ts" -gt "$model_last_ts" ]; then
+      model_last_ts=$_ts
+      [ "${_1:-0}" -gt 0 ] && model_last_is_1h=1 || model_last_is_1h=0
+    fi
   done < "${STATE_DIR}/cache_log.txt"
 fi
+
+# Cached portion of the current context = cache_read + cache_write for the active model's
+# last API call. This matches the user's mental model: cache_read+cache_write ≈ context size.
+# Unlike summing all alive writes (which over-counts by accumulating prefix deltas across turns),
+# this shows how much of the CURRENT context is cached at Anthropic right now.
+cached_now=$((tok_cr + tok_cw))
 
 # Per-model TTL: base the countdown on the last cache_log entry for the active model so
 # switching models shows the correct elapsed time for that model's cache, not a global one.
@@ -388,15 +395,18 @@ else
   elif [ "$remaining_1h" -lt 1200 ]; then cache_1h_color=$YELLOW; fi
 fi
 
-# Build TTL display: alive sums per tier when available, plain countdown otherwise
-if [ "$alive_cw5m" -gt 0 ] && [ "$alive_cw1h" -gt 0 ]; then
-  cache_timer_display="${cache_color}${cache_timer}($(fmt_tok $alive_cw5m))${RESET}${DIM} / ${RESET}${cache_1h_color}${cache_1h_timer}($(fmt_tok $alive_cw1h))${RESET}"
-elif [ "$alive_cw5m" -gt 0 ]; then
-  cache_timer_display="${cache_color}${cache_timer}($(fmt_tok $alive_cw5m))${RESET}"
-elif [ "$alive_cw1h" -gt 0 ]; then
-  cache_timer_display="${cache_1h_color}${cache_1h_timer}($(fmt_tok $alive_cw1h))${RESET}"
+# Build TTL display: show how much of the current context is cached and when it expires.
+# Use the 1h-tier countdown when the most recent cache write used the 1h tier (common in
+# Claude Code), so the timer reflects the actual expiry of the user's cached context.
+if [ "$model_last_is_1h" -eq 1 ]; then
+  _ttl_timer="$cache_1h_timer"; _ttl_color="$cache_1h_color"
 else
-  cache_timer_display="${cache_color}${cache_timer}${RESET}"
+  _ttl_timer="$cache_timer"; _ttl_color="$cache_color"
+fi
+if [ "$cached_now" -gt 0 ]; then
+  cache_timer_display="${_ttl_color}${_ttl_timer}($(fmt_tok $cached_now))${RESET}"
+else
+  cache_timer_display="${_ttl_color}${_ttl_timer}${RESET}"
 fi
 
 # Top-line cost: show both harness (matches /usage, excludes subagents) and local sum
