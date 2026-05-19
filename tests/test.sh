@@ -412,6 +412,43 @@ assert_contains     "fallback timer renders without crash" "ttl"   "$(echo "$out
 assert_contains     "no Opus entry: annotation shows (0)" "(0)"    "$(echo "$out26" | head -1)"
 assert_not_contains "Sonnet 50k not leaked to Opus"       "(50k)"  "$(echo "$out26" | head -1)"
 
+# ─── Per-model ctx override ───────────────────────────────────────────────────
+echo ""
+echo "=== Per-model ctx override ==="
+
+echo "--- Test 27: Sonnet uses its own stored ctx%, not stale Opus harness value"
+SID27="test-ctx-model-$$"
+SDIR27="/tmp/claude_session_${SID27}"
+mkdir -p "$SDIR27"
+_now27=$(date +%s)
+# cache_log: Opus (ctx=14%/200k), Sonnet (ctx=6%/1000k) — 7-col format
+echo "$((_now27 - 10))  1000 50000 claude-opus-4-7 89000 14 200"  > "$SDIR27/cache_log.txt"
+echo "$((_now27 - 600)) 0 80000 claude-sonnet-4-6 60000 6 1000"  >> "$SDIR27/cache_log.txt"
+# stdin: Sonnet active, but harness context_window is stale — reports Opus values (14%/200k)
+_stdin27=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-sonnet-4-6","display_name":"Sonnet 4.6","provider":"anthropic"},"context_window":{"used_percentage":14,"context_window_size":200000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":60000,"cache_creation_input_tokens":0,"output_tokens":50}}' "$SID27")
+echo "50:${_now27}" > "$SDIR27/last_api.ts"
+out27=$(echo "$_stdin27" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains     "Sonnet ctx: stored 6%, not stale 14%"  "ctx 6%"   "$(echo "$out27" | head -1)"
+assert_contains     "Sonnet ctx: stored 1000k"              "/1000k"   "$(echo "$out27" | head -1)"
+assert_not_contains "Stale Opus 14% not shown for Sonnet"   "ctx 14%"  "$(echo "$out27" | head -1)"
+assert_not_contains "Stale Opus 200k not shown for Sonnet"  "/200k"    "$(echo "$out27" | head -1)"
+
+echo "--- Test 28: active model has no cache_log entry — ctx falls back to harness value"
+SID28="test-ctx-fallback-$$"
+SDIR28="/tmp/claude_session_${SID28}"
+mkdir -p "$SDIR28"
+_now28=$(date +%s)
+# cache_log: only Sonnet entry (ctx=6%/1000k); active model = Opus → no match → harness fallback
+echo "$((_now28 - 10)) 0 80000 claude-sonnet-4-6 60000 6 1000" > "$SDIR28/cache_log.txt"
+# stdin: Opus active, harness says 33%/200k
+_stdin28=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":33,"context_window_size":200000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":50}}' "$SID28")
+echo "50:${_now28}" > "$SDIR28/last_api.ts"
+out28=$(echo "$_stdin28" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains     "Opus ctx falls back to harness 33%"  "ctx 33%"  "$(echo "$out28" | head -1)"
+assert_contains     "Opus ctx falls back to harness 200k" "/200k"    "$(echo "$out28" | head -1)"
+assert_not_contains "Sonnet 6% not leaked to Opus"        "ctx 6%"   "$(echo "$out28" | head -1)"
+assert_not_contains "Sonnet 1000k not leaked to Opus"     "/1000k"   "$(echo "$out28" | head -1)"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="

@@ -303,13 +303,15 @@ END {
   fi
   [ -x "${HOME}/.claude/refresh-pricing.sh" ] && "${HOME}/.claude/refresh-pricing.sh" &
 
-  # Snapshot the cached portion of the current context at the time of this turn.
-  # Written as the 5th column in cache_log so the per-model read below can return
-  # the right value even after a model switch with no intervening API call.
+  # Snapshot per-model display values at the time of this turn.
+  # Written as cols 5-7 in cache_log so the per-model read below returns the
+  # correct values for each model even after a model switch with no intervening call.
   cached_now=$((tok_cr + tok_cw))
+  turn_ctx_pct=${ctx_pct:-0}
+  turn_ctx_kb=${ctx_kb:-0}
 
   # Record this turn's 5m/1h cache writes in cache_log for alive-cache TTL tracking.
-  # Format per line: "<unix_ts> <cw5m> <cw1h> <model_id> <cached_now>". Entries older than 1h are pruned.
+  # Format per line: "<unix_ts> <cw5m> <cw1h> <model_id> <cached_now> <ctx_pct> <ctx_kb>". Entries older than 1h are pruned.
   # Each model (Opus, Sonnet, etc.) has a separate cache at Anthropic; we tag entries
   # with the model so that alive sums are filtered to the currently active model only.
   turn_cw5m=0; turn_cw1h=0; turn_model_id="${model_id:-unknown}"
@@ -327,10 +329,10 @@ END {
     [ -n "$_m" ] && turn_model_id="$_m"
   fi
   {
-    while IFS=' ' read -r _ts _5 _1 _m _c; do
-      [ "$((_ts + 3600 - now))" -gt 0 ] && echo "$_ts $_5 $_1 $_m ${_c:-0}"
+    while IFS=' ' read -r _ts _5 _1 _m _c _cp _ck; do
+      [ "$((_ts + 3600 - now))" -gt 0 ] && echo "$_ts $_5 $_1 $_m ${_c:-0} ${_cp:-0} ${_ck:-0}"
     done < "${STATE_DIR}/cache_log.txt" 2>/dev/null
-    echo "${now} ${turn_cw5m} ${turn_cw1h} ${turn_model_id} ${cached_now}"
+    echo "${now} ${turn_cw5m} ${turn_cw1h} ${turn_model_id} ${cached_now} ${turn_ctx_pct} ${turn_ctx_kb}"
   } > "${STATE_DIR}/cache_log.txt.tmp" 2>/dev/null && \
     mv "${STATE_DIR}/cache_log.txt.tmp" "${STATE_DIR}/cache_log.txt" 2>/dev/null
 fi
@@ -346,8 +348,9 @@ case "$model" in
   *)       _cache_filter="$model_id" ;;  # best effort for unknown display names
 esac
 model_last_ts=0; model_last_is_1h=0; model_last_cached=0
+model_last_ctx_pct=""; model_last_ctx_kb=""
 if [ -f "${STATE_DIR}/cache_log.txt" ]; then
-  while IFS=' ' read -r _ts _5 _1 _m _c; do
+  while IFS=' ' read -r _ts _5 _1 _m _c _cp _ck; do
     # Skip entries from a different model; skip old 3-column entries (no model tag)
     [ -z "$_m" ] && continue
     # Skip entries that predate the last /compact — that cache no longer exists at Anthropic
@@ -360,8 +363,23 @@ if [ -f "${STATE_DIR}/cache_log.txt" ]; then
       model_last_ts=$_ts
       [ "${_1:-0}" -gt 0 ] && model_last_is_1h=1 || model_last_is_1h=0
       model_last_cached=${_c:-0}
+      model_last_ctx_pct=${_cp:-}
+      model_last_ctx_kb=${_ck:-}
     fi
   done < "${STATE_DIR}/cache_log.txt"
+fi
+
+# Per-model ctx override: use cache_log stored ctx values so switching models in
+# opusplan reflects each model's own context immediately without waiting for a new API call.
+# Skip when stored ctx_pct=0 — compact or fresh state where the first-pass post-compact
+# recovery already produced the correct ctx_str; don't clobber it.
+if [ -n "$model_last_ctx_pct" ] && [ "$model_last_ctx_pct" != "0" ] && [ -n "$model_last_ctx_kb" ]; then
+  ctx_pct=$model_last_ctx_pct
+  ctx_kb=$model_last_ctx_kb
+  if [ "$ctx_pct" -lt 50 ]; then ctx_color=$GREEN
+  elif [ "$ctx_pct" -lt 80 ]; then ctx_color=$YELLOW
+  else ctx_color=$RED; fi
+  ctx_str="ctx ${ctx_color}${ctx_pct}%${RESET}${DIM}/${ctx_kb}k${RESET}"
 fi
 
 # Per-model TTL: base the countdown on the last cache_log entry for the active model so
