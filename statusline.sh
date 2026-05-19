@@ -303,8 +303,13 @@ END {
   fi
   [ -x "${HOME}/.claude/refresh-pricing.sh" ] && "${HOME}/.claude/refresh-pricing.sh" &
 
+  # Snapshot the cached portion of the current context at the time of this turn.
+  # Written as the 5th column in cache_log so the per-model read below can return
+  # the right value even after a model switch with no intervening API call.
+  cached_now=$((tok_cr + tok_cw))
+
   # Record this turn's 5m/1h cache writes in cache_log for alive-cache TTL tracking.
-  # Format per line: "<unix_ts> <cw5m> <cw1h> <model_id>". Entries older than 1h are pruned.
+  # Format per line: "<unix_ts> <cw5m> <cw1h> <model_id> <cached_now>". Entries older than 1h are pruned.
   # Each model (Opus, Sonnet, etc.) has a separate cache at Anthropic; we tag entries
   # with the model so that alive sums are filtered to the currently active model only.
   turn_cw5m=0; turn_cw1h=0; turn_model_id="${model_id:-unknown}"
@@ -322,10 +327,10 @@ END {
     [ -n "$_m" ] && turn_model_id="$_m"
   fi
   {
-    while IFS=' ' read -r _ts _5 _1 _m; do
-      [ "$((_ts + 3600 - now))" -gt 0 ] && echo "$_ts $_5 $_1 $_m"
+    while IFS=' ' read -r _ts _5 _1 _m _c; do
+      [ "$((_ts + 3600 - now))" -gt 0 ] && echo "$_ts $_5 $_1 $_m ${_c:-0}"
     done < "${STATE_DIR}/cache_log.txt" 2>/dev/null
-    echo "${now} ${turn_cw5m} ${turn_cw1h} ${turn_model_id}"
+    echo "${now} ${turn_cw5m} ${turn_cw1h} ${turn_model_id} ${cached_now}"
   } > "${STATE_DIR}/cache_log.txt.tmp" 2>/dev/null && \
     mv "${STATE_DIR}/cache_log.txt.tmp" "${STATE_DIR}/cache_log.txt" 2>/dev/null
 fi
@@ -340,9 +345,9 @@ case "$model" in
   Haiku*)  _cache_filter="claude-haiku" ;;
   *)       _cache_filter="$model_id" ;;  # best effort for unknown display names
 esac
-model_last_ts=0; model_last_is_1h=0
+model_last_ts=0; model_last_is_1h=0; model_last_cached=0
 if [ -f "${STATE_DIR}/cache_log.txt" ]; then
-  while IFS=' ' read -r _ts _5 _1 _m; do
+  while IFS=' ' read -r _ts _5 _1 _m _c; do
     # Skip entries from a different model; skip old 3-column entries (no model tag)
     [ -z "$_m" ] && continue
     # Skip entries that predate the last /compact — that cache no longer exists at Anthropic
@@ -354,15 +359,10 @@ if [ -f "${STATE_DIR}/cache_log.txt" ]; then
     if [ "$_ts" -gt "$model_last_ts" ]; then
       model_last_ts=$_ts
       [ "${_1:-0}" -gt 0 ] && model_last_is_1h=1 || model_last_is_1h=0
+      model_last_cached=${_c:-0}
     fi
   done < "${STATE_DIR}/cache_log.txt"
 fi
-
-# Cached portion of the current context = cache_read + cache_write for the active model's
-# last API call. This matches the user's mental model: cache_read+cache_write ≈ context size.
-# Unlike summing all alive writes (which over-counts by accumulating prefix deltas across turns),
-# this shows how much of the CURRENT context is cached at Anthropic right now.
-cached_now=$((tok_cr + tok_cw))
 
 # Per-model TTL: base the countdown on the last cache_log entry for the active model so
 # switching models shows the correct elapsed time for that model's cache, not a global one.
@@ -403,11 +403,7 @@ if [ "$model_last_is_1h" -eq 1 ]; then
 else
   _ttl_timer="$cache_timer"; _ttl_color="$cache_color"
 fi
-if [ "$cached_now" -gt 0 ]; then
-  cache_timer_display="${_ttl_color}${_ttl_timer}($(fmt_tok $cached_now))${RESET}"
-else
-  cache_timer_display="${_ttl_color}${_ttl_timer}${RESET}"
-fi
+cache_timer_display="${_ttl_color}${_ttl_timer}($(fmt_tok $model_last_cached))${RESET}"
 
 # Top-line cost: show both harness (matches /usage, excludes subagents) and local sum
 # (includes subagents, uses LiteLLM rates). Neither is the authoritative Anthropic bill.
