@@ -308,15 +308,21 @@ fi
 
 # Sum cache writes still within their TTL window, filtered to the active model.
 # Opus and Sonnet maintain separate caches at Anthropic; mixing them would mislead.
-# JSONL model IDs may carry a date suffix (e.g. claude-haiku-4-5-20251001) while the
-# harness uses the base ID — use prefix match so both forms resolve correctly.
+# model_id may be an alias like "opusplan" rather than a real Claude model ID, so
+# derive the filter prefix from display_name ("Opus 4.7" → "claude-opus") instead.
+case "$model" in
+  Opus*)   _cache_filter="claude-opus" ;;
+  Sonnet*) _cache_filter="claude-sonnet" ;;
+  Haiku*)  _cache_filter="claude-haiku" ;;
+  *)       _cache_filter="$model_id" ;;  # best effort for unknown display names
+esac
 alive_cw5m=0; alive_cw1h=0
 if [ -f "${STATE_DIR}/cache_log.txt" ]; then
   while IFS=' ' read -r _ts _5 _1 _m; do
     # Skip entries from a different model; skip old 3-column entries (no model tag)
     [ -z "$_m" ] && continue
     case "$_m" in
-      "${model_id}"*) ;;   # exact match or JSONL date-suffix variant
+      "${_cache_filter}"*) ;;
       *) continue ;;
     esac
     [ "${_5:-0}" -gt 0 ] && [ "$((_ts + 300 - now))" -gt 0 ] && alive_cw5m=$((alive_cw5m + _5))
