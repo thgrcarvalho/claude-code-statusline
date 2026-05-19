@@ -317,6 +317,48 @@ assert_not_contains "expired 5m not shown"         "(5.0k)"  "$(echo "$out22" | 
 assert_not_contains "other model tokens excluded"  "(9.0k)"  "$(echo "$out22" | head -1)"
 assert_contains     "alive 1h = 200k"              "(200k)"  "$(echo "$out22" | head -1)"
 
+# ─── compact_boundary cache_log floor ────────────────────────────────────────
+echo ""
+echo "=== compact_boundary cache_log floor ==="
+
+echo "--- Test 23: cache_log entries before most-recent compact_boundary are excluded"
+SID23="test-compact-floor-$$"
+SDIR23="/tmp/claude_session_${SID23}"
+mkdir -p "$SDIR23"
+_now23=$(date +%s)
+_compact_ts23=$((_now23 - 200))   # compact happened 200s ago
+# Format epoch as ISO 8601 UTC — try GNU date, fall back to BSD date
+_compact_iso23=$(date -u -d "@${_compact_ts23}" +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || \
+                  date -u -r "${_compact_ts23}" +"%Y-%m-%dT%H:%M:%S.000Z")
+_compact_fixture23="/tmp/test23-compact-$$.jsonl"
+printf '{"type":"user","subtype":"compact_boundary","uuid":"uuid-compact-23","timestamp":"%s","message":{"role":"user","content":"compact"},"compactMetadata":{"postTokens":5000}}\n' \
+  "$_compact_iso23" > "$_compact_fixture23"
+printf '{"type":"assistant","uuid":"uuid-a23","message":{"role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}\n' \
+  >> "$_compact_fixture23"
+# Pre-compact entry (230s ago = 30s before compact): within 5m TTL — should be EXCLUDED by compact floor
+# Post-compact entry (60s ago = 140s after compact): within 5m TTL — should be INCLUDED
+echo "$((_now23 - 230)) 3000 0 claude-opus-4-7"   > "$SDIR23/cache_log.txt"
+echo "$((_now23 - 60))  5000 0 claude-opus-4-7"  >> "$SDIR23/cache_log.txt"
+_stdin23=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":14,"context_window_size":1000000},"current_usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":100}}' \
+  "$SID23" "$_compact_fixture23")
+out23=$(echo "$_stdin23" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_not_contains "pre-compact 3k excluded"  "(3.0k)"  "$(echo "$out23" | head -1)"
+assert_contains     "post-compact 5k included" "(5.0k)"  "$(echo "$out23" | head -1)"
+rm -f "$_compact_fixture23"
+
+echo "--- Test 24: no compact_boundary in transcript — no floor, both entries summed"
+SID24="test-no-compact-$$"
+SDIR24="/tmp/claude_session_${SID24}"
+mkdir -p "$SDIR24"
+_now24=$(date +%s)
+# Same structure as Test 23 but transcript has no compact_boundary → no floor
+echo "$((_now24 - 230)) 3000 0 claude-opus-4-7"   > "$SDIR24/cache_log.txt"
+echo "$((_now24 - 60))  5000 0 claude-opus-4-7"  >> "$SDIR24/cache_log.txt"
+_stdin24=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-4-7","display_name":"Opus 4.7","provider":"anthropic"},"context_window":{"used_percentage":14,"context_window_size":1000000},"current_usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":100}}' \
+  "$SID24")
+out24=$(echo "$_stdin24" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "no compact: 3k+5k = 8.0k both summed" "(8.0k)" "$(echo "$out24" | head -1)"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="

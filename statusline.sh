@@ -19,6 +19,14 @@ BLUE=$'\033[34m'
 _str()  { echo "$input" | grep "\"$1\"" | head -1 | sed -E 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'; }
 # Extract a string field scoped to a parent section (avoids matching duplicate keys in other sections)
 _sstr() { echo "$input" | grep -A20 "\"$1\"[[:space:]]*:" | grep "\"$2\"" | head -1 | sed -E 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'; }
+# Convert ISO 8601 UTC timestamp to epoch seconds (cross-platform: GNU date and BSD date).
+iso_to_epoch() {
+  local iso="$1" e
+  e=$(date -d "$iso" +%s 2>/dev/null) && [ -n "$e" ] && echo "$e" && return
+  local clean="${iso%.*Z}"; clean="${clean%Z}"        # strip fractional seconds + Z for BSD date
+  date -j -u -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null && return
+  echo 0
+}
 # Extract a numeric field scoped to a parent section
 _snum() {
   echo "$input" \
@@ -156,12 +164,28 @@ if [ "$ctx_pct" -lt 50 ]; then ctx_color=$GREEN
 elif [ "$ctx_pct" -lt 80 ]; then ctx_color=$YELLOW
 else ctx_color=$RED; fi
 
-# Post-/compact: harness resets used_percentage to 0, but the JSONL records the
-# real surviving context size in compact_boundary.compactMetadata.postTokens.
+# Locate the most recent compact_boundary in the transcript (always, not just when ctx_pct==0).
+# Used both for ctx% recovery and for the cache_log floor that guards stale pre-compact entries.
+_compact_line=""
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+  _compact_line=$(grep '"subtype":"compact_boundary"' "$transcript_path" 2>/dev/null | tail -1)
+fi
+
+# cache_log floor: any cache_log entry written before the most recent compact is stale —
+# /compact rewrites conversation history, which invalidates Anthropic's prompt cache.
+compact_floor_ts=0
+if [ -n "$_compact_line" ]; then
+  _compact_iso=$(echo "$_compact_line" \
+    | grep -oE '"timestamp"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 | grep -oE '"[^"]*"$' | tr -d '"')
+  [ -n "$_compact_iso" ] && compact_floor_ts=$(iso_to_epoch "$_compact_iso")
+fi
+
+# Post-/compact ctx% recovery: harness resets used_percentage to 0, but the JSONL records
+# the real surviving context size in compact_boundary.compactMetadata.postTokens.
 ctx_post=""
-if [ "$ctx_pct" = "0" ] && [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-  ctx_post=$(grep '"subtype":"compact_boundary"' "$transcript_path" 2>/dev/null \
-    | tail -1 \
+if [ "$ctx_pct" = "0" ] && [ -n "$_compact_line" ]; then
+  ctx_post=$(echo "$_compact_line" \
     | grep -oE '"postTokens"[[:space:]]*:[[:space:]]*[0-9]+' \
     | grep -oE '[0-9]+$')
 fi
@@ -321,6 +345,8 @@ if [ -f "${STATE_DIR}/cache_log.txt" ]; then
   while IFS=' ' read -r _ts _5 _1 _m; do
     # Skip entries from a different model; skip old 3-column entries (no model tag)
     [ -z "$_m" ] && continue
+    # Skip entries that predate the last /compact — that cache no longer exists at Anthropic
+    [ "$_ts" -lt "$compact_floor_ts" ] && continue
     case "$_m" in
       "${_cache_filter}"*) ;;
       *) continue ;;
