@@ -164,11 +164,33 @@ if [ "$ctx_pct" -lt 50 ]; then ctx_color=$GREEN
 elif [ "$ctx_pct" -lt 80 ]; then ctx_color=$YELLOW
 else ctx_color=$RED; fi
 
+# State dir per session (defined early so the compact-boundary cache below can live here).
+STATE_DIR="/tmp/claude_session_${session_id}"
+mkdir -p "$STATE_DIR" 2>/dev/null
+LAST_STATE="${STATE_DIR}/last_api.ts"
+SESSION_COST="${STATE_DIR}/session_cost.txt"
+MODEL_BREAKDOWN="${STATE_DIR}/model_breakdown.txt"  # space-delimited: model in cr cw5m cw1h out
+
 # Locate the most recent compact_boundary in the transcript (always, not just when ctx_pct==0).
-# Used both for ctx% recovery and for the cache_log floor that guards stale pre-compact entries.
+# Used for ctx% recovery and for the cache_log floor that guards stale pre-compact entries.
+# A bare grep would rescan the whole transcript (multi-MB in long sessions) on every 1s render,
+# yet the boundary only changes when a compaction occurs. Cache the matched line keyed on the
+# transcript's size+mtime and re-scan only when the file changes; idle renders reuse the cache.
 _compact_line=""
 if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-  _compact_line=$(grep '"subtype":"compact_boundary"' "$transcript_path" 2>/dev/null | tail -1)
+  _bcache="${STATE_DIR}/compact_boundary.cache"
+  _tstat=$(stat -c '%s:%Y' "$transcript_path" 2>/dev/null || stat -f '%z:%m' "$transcript_path" 2>/dev/null)
+  _bkey=""; _bval=""
+  [ -f "$_bcache" ] && IFS=$'\t' read -r _bkey _bval < "$_bcache"
+  if [ -n "$_tstat" ] && [ "$_tstat" = "$_bkey" ]; then
+    _compact_line="$_bval"
+  else
+    _compact_line=$(grep '"subtype":"compact_boundary"' "$transcript_path" 2>/dev/null | tail -1)
+    if [ -n "$_tstat" ]; then
+      printf '%s\t%s\n' "$_tstat" "$_compact_line" > "${_bcache}.tmp" 2>/dev/null \
+        && mv "${_bcache}.tmp" "$_bcache" 2>/dev/null
+    fi
+  fi
 fi
 
 # cache_log floor: any cache_log entry written before the most recent compact is stale —
@@ -206,13 +228,6 @@ if [ "$cache_pct" -gt 80 ]; then hit_color=$GREEN
 elif [ "$cache_pct" -gt 40 ]; then hit_color=$YELLOW
 else hit_color=$RED; fi
 
-# State dir per session
-STATE_DIR="/tmp/claude_session_${session_id}"
-mkdir -p "$STATE_DIR" 2>/dev/null
-LAST_STATE="${STATE_DIR}/last_api.ts"
-SESSION_COST="${STATE_DIR}/session_cost.txt"
-MODEL_BREAKDOWN="${STATE_DIR}/model_breakdown.txt"  # space-delimited: model in cr cw5m cw1h out
-
 now=$(date +%s)
 
 # /compact cost capture. Claude Code folds the /compact summarization cost into
@@ -238,7 +253,8 @@ if [ -n "$_cc_prev_floor" ] && [ "$_cc_floor" != "$_cc_prev_floor" ] && [ "$_cc_
   compact_count=$((compact_count + 1))
   compact_total=$(awk -v a="$compact_total" -v b="$_cc_delta" 'BEGIN{printf "%.6f", a+b}')
 fi
-echo "${compact_count} ${compact_total} ${_cc_now} ${_cc_floor}" > "$COMPACT_STATE"
+echo "${compact_count} ${compact_total} ${_cc_now} ${_cc_floor}" > "${COMPACT_STATE}.tmp" \
+  && mv "${COMPACT_STATE}.tmp" "$COMPACT_STATE"
 
 prev_tout="-1"
 prev_ts=$now
