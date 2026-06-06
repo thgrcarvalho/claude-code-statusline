@@ -15,10 +15,6 @@ YELLOW=$'\033[33m'
 RED=$'\033[91m'
 BLUE=$'\033[34m'
 
-# Extract a top-level string field (unambiguous keys like session_id, transcript_path)
-_str()  { echo "$input" | grep "\"$1\"" | head -1 | sed -E 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'; }
-# Extract a string field scoped to a parent section (avoids matching duplicate keys in other sections)
-_sstr() { echo "$input" | grep -A20 "\"$1\"[[:space:]]*:" | grep "\"$2\"" | head -1 | sed -E 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'; }
 # Convert ISO 8601 UTC timestamp to epoch seconds (cross-platform: GNU date and BSD date).
 iso_to_epoch() {
   local iso="$1" e
@@ -27,26 +23,58 @@ iso_to_epoch() {
   date -j -u -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null && return
   echo 0
 }
-# Extract a numeric field scoped to a parent section
-_snum() {
-  echo "$input" \
-    | grep -A20 "\"$1\"[[:space:]]*:" \
-    | grep -oE "\"$2\"[[:space:]]*:[[:space:]]*[0-9]+\.?[0-9]*" \
-    | head -1 \
-    | grep -oE '[0-9]+\.?[0-9]*$'
+# Extract every stdin field in ONE awk pass (was ~11 grep|sed pipelines ≈ 55 forks per render).
+# Handles compact and pretty-printed JSON by joining all input into one buffer, then matching by
+# exact key name. display_name/id are scoped to the model section (effort/output_style also carry
+# display_name); numeric keys are unambiguous because the leading quote in the pattern stops
+# "input_tokens" from matching "cache_*_input_tokens". Emits 11 newline-separated values in a
+# fixed order — empty when a key is absent, so the reads below stay in sync.
+{
+  read -r model
+  read -r model_id
+  read -r ctx_pct
+  read -r ctx_kb
+  read -r cost
+  read -r tok_fresh
+  read -r tok_cr
+  read -r tok_cw
+  read -r tok_out
+  read -r session_id
+  read -r transcript_path
+} < <(printf '%s\n' "$input" | awk '
+function sval(s, key,   m) {
+  if (match(s, "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\"")) {
+    m = substr(s, RSTART, RLENGTH)
+    sub("\"" key "\"[[:space:]]*:[[:space:]]*\"", "", m); sub("\".*", "", m)
+    return m
+  }
+  return ""
 }
-
-model=$(         _sstr model           display_name)
-model_id=$(      _sstr model           id)
-ctx_pct=$(       _snum context_window  used_percentage)
-ctx_kb=$(        _snum context_window  context_window_size | awk '{printf "%d", $1/1000}')
-cost=$(          _snum cost            total_cost_usd)
-tok_fresh=$(     _snum current_usage   input_tokens)
-tok_cr=$(        _snum current_usage   cache_read_input_tokens)
-tok_cw=$(        _snum current_usage   cache_creation_input_tokens)
-tok_out=$(       _snum current_usage   output_tokens)
-session_id=$(    _str  session_id)
-transcript_path=$(_str transcript_path)
+function nval(s, key,   m) {
+  if (match(s, "\"" key "\"[[:space:]]*:[[:space:]]*-?[0-9]+\\.?[0-9]*")) {
+    m = substr(s, RSTART, RLENGTH); sub(".*:[[:space:]]*", "", m)
+    return m
+  }
+  return ""
+}
+{ buf = buf $0 " " }
+END {
+  mi = index(buf, "\"model\"")
+  mseg = (mi > 0) ? substr(buf, mi) : ""
+  size = nval(buf, "context_window_size")
+  print sval(mseg, "display_name")
+  print sval(mseg, "id")
+  print nval(buf, "used_percentage")
+  print (size == "" ? "" : int(size / 1000))
+  print nval(buf, "total_cost_usd")
+  print nval(buf, "input_tokens")
+  print nval(buf, "cache_read_input_tokens")
+  print nval(buf, "cache_creation_input_tokens")
+  print nval(buf, "output_tokens")
+  print sval(buf, "session_id")
+  print sval(buf, "transcript_path")
+}
+')
 
 model="${model:-?}"
 ctx_pct="${ctx_pct:-0}"
@@ -500,29 +528,48 @@ printf "%s ~ttl %s\n" "${sep}" "$cache_timer_display"
 # Columns: model in cr cw5m cw1h out web fetch
 total_cost=0
 if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
-  while IFS=' ' read -r m_id m_in m_cr m_cw5m m_cw1h m_out m_web m_fetch; do
-    m_web="${m_web:-0}"; m_fetch="${m_fetch:-0}"
-    [ "$((m_in + m_cr + m_cw5m + m_cw1h + m_out))" -eq 0 ] && continue
-    m_name=$(model_display "$m_id")
-    read m_pin m_pout <<< "$(pricing_for "$m_id")"
-    m_pcr=$(awk   -v b="$m_pin" 'BEGIN {printf "%.4f", b * 0.10}')
-    m_pcw5m=$(awk -v b="$m_pin" 'BEGIN {printf "%.4f", b * 1.25}')
-    m_pcw1h=$(awk -v b="$m_pin" 'BEGIN {printf "%.4f", b * 2.00}')
-    m_cw_total=$((m_cw5m + m_cw1h))
-    m_cost=$(echo "$m_in $m_pin $m_cr $m_pcr $m_cw5m $m_pcw5m $m_cw1h $m_pcw1h $m_out $m_pout $m_web $m_fetch" | awk '{
-      web_cost = ($11 + $12) * 0.010
-      printf "%.6f", ($1*$2 + $3*$4 + $5*$6 + $7*$8 + $9*$10) / 1000000 + web_cost
-    }')
-    total_cost=$(awk -v a="$total_cost" -v b="$m_cost" 'BEGIN {printf "%.6f", a+b}')
-    ws_suffix=""
-    [ "$m_web" -gt 0 ] 2>/dev/null && ws_suffix=" ${DIM}+${m_web}ws${RESET}"
-    printf "${DIM}Σ ${CYAN}%s${RESET}${DIM}: ↑%s +%sr +%sw ↓%s = ${YELLOW}%s${RESET}%s\n" \
-      "$m_name" \
-      "$(fmt_tok $m_in)" "$(fmt_tok $m_cr)" "$(fmt_tok $m_cw_total)" "$(fmt_tok $m_out)" \
-      "$(fmt_c $m_cost)" "$ws_suffix"
-  done < "$MODEL_BREAKDOWN"
-  # Write local sum as fallback for when harness omits cost.total_cost_usd
-  echo "$total_cost" > "$SESSION_COST"
+  # The Σ rows depend only on model_breakdown.txt (rewritten per-turn) and the pricing file
+  # (refreshed at most daily) — yet this loop reran every 1s render, re-deriving pricing and
+  # formatting per model. Cache the rendered rows keyed on both files' mtimes; on idle renders
+  # reuse the cache. total_cost is persisted in SESSION_COST, which the top-line reads directly,
+  # so a cache hit needn't recompute it. stat() the mtime BEFORE reading the file so a concurrent
+  # background rewrite can only cause an extra recompute, never a stale row cached under a new key.
+  SIGMA_TXT="${STATE_DIR}/sigma_render.txt"
+  SIGMA_KEY="${STATE_DIR}/sigma_render.key"
+  _mb_m=$(stat -c '%Y' "$MODEL_BREAKDOWN" 2>/dev/null || stat -f '%m' "$MODEL_BREAKDOWN" 2>/dev/null)
+  _pr_m=$(stat -c '%Y' /tmp/claude_pricing.txt 2>/dev/null || stat -f '%m' /tmp/claude_pricing.txt 2>/dev/null)
+  _sigma_key="${_mb_m:-0}:${_pr_m:-0}"
+  if [ -f "$SIGMA_TXT" ] && [ "$(cat "$SIGMA_KEY" 2>/dev/null)" = "$_sigma_key" ]; then
+    cat "$SIGMA_TXT"
+  else
+    _sigma_out=""
+    while IFS=' ' read -r m_id m_in m_cr m_cw5m m_cw1h m_out m_web m_fetch; do
+      m_web="${m_web:-0}"; m_fetch="${m_fetch:-0}"
+      [ "$((m_in + m_cr + m_cw5m + m_cw1h + m_out))" -eq 0 ] && continue
+      m_name=$(model_display "$m_id")
+      read m_pin m_pout <<< "$(pricing_for "$m_id")"
+      m_pcr=$(awk   -v b="$m_pin" 'BEGIN {printf "%.4f", b * 0.10}')
+      m_pcw5m=$(awk -v b="$m_pin" 'BEGIN {printf "%.4f", b * 1.25}')
+      m_pcw1h=$(awk -v b="$m_pin" 'BEGIN {printf "%.4f", b * 2.00}')
+      m_cw_total=$((m_cw5m + m_cw1h))
+      m_cost=$(echo "$m_in $m_pin $m_cr $m_pcr $m_cw5m $m_pcw5m $m_cw1h $m_pcw1h $m_out $m_pout $m_web $m_fetch" | awk '{
+        web_cost = ($11 + $12) * 0.010
+        printf "%.6f", ($1*$2 + $3*$4 + $5*$6 + $7*$8 + $9*$10) / 1000000 + web_cost
+      }')
+      total_cost=$(awk -v a="$total_cost" -v b="$m_cost" 'BEGIN {printf "%.6f", a+b}')
+      ws_suffix=""
+      [ "$m_web" -gt 0 ] 2>/dev/null && ws_suffix=" ${DIM}+${m_web}ws${RESET}"
+      _sigma_out="${_sigma_out}$(printf "${DIM}Σ ${CYAN}%s${RESET}${DIM}: ↑%s +%sr +%sw ↓%s = ${YELLOW}%s${RESET}%s" \
+        "$m_name" \
+        "$(fmt_tok $m_in)" "$(fmt_tok $m_cr)" "$(fmt_tok $m_cw_total)" "$(fmt_tok $m_out)" \
+        "$(fmt_c $m_cost)" "$ws_suffix")"$'\n'
+    done < "$MODEL_BREAKDOWN"
+    printf '%s' "$_sigma_out"
+    printf '%s' "$_sigma_out" > "${SIGMA_TXT}.tmp" 2>/dev/null && mv "${SIGMA_TXT}.tmp" "$SIGMA_TXT" 2>/dev/null
+    echo "$_sigma_key" > "${SIGMA_KEY}.tmp" 2>/dev/null && mv "${SIGMA_KEY}.tmp" "$SIGMA_KEY" 2>/dev/null
+    # Write local sum as fallback for when harness omits cost.total_cost_usd
+    echo "$total_cost" > "$SESSION_COST"
+  fi
 fi
 
 # Σ /compact line: cumulative cost of /compact summarizations this session.
