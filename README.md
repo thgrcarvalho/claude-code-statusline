@@ -11,10 +11,11 @@ A feature-rich status line for [Claude Code](https://claude.ai/code) that shows 
 Opus 4.7 │ ctx 14%/200k │ $0.42 / $0.65 │ ↑1 +87kr +2kw ↓312 │ hit 97% │ ~ttl 0:59:01(89k)
 ```
 
-**Line 2+ — per-model session totals (including sub-agents):**
+**Line 2+ — per-model session totals (including sub-agents), plus `/compact` cost:**
 ```
 Σ Opus 4.7:   ↑12 +1.4Mr +80kw ↓7k = $0.38
 Σ Sonnet 4.6: ↑8  +210kr +30kw ↓3k = $0.27
+Σ /compact ×2: $0.42
 ```
 
 | Field | Meaning |
@@ -29,6 +30,7 @@ Opus 4.7 │ ctx 14%/200k │ $0.42 / $0.65 │ ↑1 +87kr +2kw ↓312 │ hit 9
 | `~ttl T(Xk)` | Countdown until the cached portion of your current context expires + how many tokens of the current context are cached (`cache_read + cache_write` of this call). Uses 1h-tier countdown when last cache write went to the 1h tier, 5m-tier otherwise. Timer is per-model — switching models shows the correct remaining TTL for that model's cache. |
 | `+Nws` | Web-search requests this model made, billed at $10 / 1k |
 | `Σ model: ...` | Cumulative token totals + cost per model, from transcript JSONLs including sub-agents |
+| `Σ /compact ×N: $X` | Cumulative cost of the `N` `/compact` summarizations run this session. Exact, not estimated — each is the `cost.total_cost_usd` step captured at the compact boundary |
 
 ---
 
@@ -36,6 +38,7 @@ Opus 4.7 │ ctx 14%/200k │ $0.42 / $0.65 │ ↑1 +87kr +2kw ↓312 │ hit 9
 
 - **Live per-model cost breakdown** — separate Σ rows for Opus, Sonnet, Haiku, and any future models
 - **Sub-agent token tracking** — Explore, Plan, and other agents are included in the Σ totals
+- **`/compact` cost tracking** — a cumulative `Σ /compact ×N` row showing exactly what compaction has cost this session (`/clear` is free and shows nothing)
 - **Auto-updating pricing** — fetches latest rates from [LiteLLM's database](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json) once per day; covers all active and legacy Claude models with correct per-version rates
 - **Cache hit % and TTL countdown** — tells you how efficiently the cache is being used and when it might expire
 - **Hardcoded fallback rates** — works offline; if LiteLLM is unreachable the last-known rates stay in effect
@@ -133,6 +136,8 @@ The statusline script is invoked by Claude Code every second via `refreshInterva
 
 **Σ per-model rows** are computed by parsing the session's JSONL transcript (plus any sub-agent JSONL files in the same directory) on each new API response. The breakdown is written to `/tmp/claude_session_<id>/model_breakdown.txt` and read back on subsequent renders.
 
+**`/compact` cost** is tracked separately because the summarization call it triggers never appears as a usage-bearing assistant entry in the transcript — so the Σ per-model rows can't see it. Claude Code does, however, fold the compaction cost into `cost.total_cost_usd` (verified empirically: the harness total steps up by the exact compaction cost at the moment a new `compact_boundary` is written). The statusline tracks the harness total across renders and, when a new compact boundary appears, attributes the cost rise since the previous render to that compaction — accumulating it into the `Σ /compact ×N` row. State lives in `/tmp/claude_session_<id>/compact_cost.txt`. Because the figure is the real harness delta, it's exact, not estimated. Compactions that happened *before* the feature was active aren't priced retroactively (their deltas were never captured), and `/clear` — which starts a new session with a fresh state dir and costs nothing — never produces a row. Both manual and auto-compactions are counted; for an auto-compaction that fires mid-turn, the captured delta may also fold in that turn's in-flight cost.
+
 **Pricing** is fetched from LiteLLM's community-maintained `model_prices_and_context_window.json` at most once per 24 hours and cached in `/tmp/claude_pricing.txt`. Cache read/write rates follow Anthropic's standard ratios (read = 10%, write_5m = 125%, write_1h = 200% of the base input price) derived at runtime — only the base input and output rates are stored.
 
 ---
@@ -162,6 +167,8 @@ The top-line shows `$<harness> / $<local>`:
 
 If `$<local>` is much higher than `$<harness>`, that gap is your sub-agents' cost.
 
+`/compact` cost sits on the `$<harness>` side of this split: it's folded into `cost.total_cost_usd` but never reaches the transcript, so it's absent from `$<local>`. The dedicated `Σ /compact ×N` row breaks out that component so you can see how much of the harness total is compaction.
+
 Neither figure is the definitive Anthropic bill — for that, check the [Anthropic Console](https://console.anthropic.com/) dashboard. This divergence is a known gap in Claude Code's `/usage` tracking, tracked upstream in the issues linked above.
 
 ---
@@ -185,7 +192,7 @@ All configuration is in `statusline.sh`. Common knobs:
 ./tests/test.sh
 ```
 
-Runs 55 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard, multiple `display_name` ambiguity, JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`, cache-write double-count regression, web-search counter propagation), dual-cost top-line display (harness + local, fallback cases), dual-TTL display with 5m/1h token-count annotations, compact_boundary cache_log floor (pre-compact entries excluded), and an end-to-end render with Σ lines.
+Runs 72 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard, multiple `display_name` ambiguity, JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`, cache-write double-count regression, web-search counter propagation), dual-cost top-line display (harness + local, fallback cases), dual-TTL display with 5m/1h token-count annotations, compact_boundary cache_log floor (pre-compact entries excluded), `/compact` cost capture (per-boundary delta accumulation, no double-counting on normal turns, no retroactive pricing of pre-feature compactions), and an end-to-end render with Σ lines.
 
 CI runs automatically on every push and pull request via GitHub Actions (no extra dependencies — `jq` is intentionally absent to verify the no-jq path).
 

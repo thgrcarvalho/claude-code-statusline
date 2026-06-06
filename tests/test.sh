@@ -449,6 +449,58 @@ assert_contains     "Opus ctx falls back to harness 200k" "/200k"    "$(echo "$o
 assert_not_contains "Sonnet 6% not leaked to Opus"        "ctx 6%"   "$(echo "$out28" | head -1)"
 assert_not_contains "Sonnet 1000k not leaked to Opus"     "/1000k"   "$(echo "$out28" | head -1)"
 
+# ─── /compact cost capture ───────────────────────────────────────────────────
+echo ""
+echo "=== /compact cost capture ==="
+
+# Helper: emit harness stdin with a given total_cost_usd and transcript path.
+_compact_stdin() { # $1=session_id  $2=cost  $3=transcript_path
+  printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-4-8","display_name":"Opus 4.8","provider":"anthropic"},"context_window":{"used_percentage":50,"context_window_size":1000000},"cost":{"total_cost_usd":%s},"current_usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":0,"output_tokens":50}}' "$1" "$3" "$2"
+}
+_boundary() { # $1=iso_timestamp
+  printf '{"type":"system","subtype":"compact_boundary","timestamp":"%s","compactMetadata":{"trigger":"manual","preTokens":79508,"postTokens":4450}}\n' "$1"
+}
+
+echo "--- Test 29: cost delta captured at each compact boundary, accumulated"
+SID29="test-compact-$$"
+SDIR29="/tmp/claude_session_${SID29}"
+TR29="/tmp/claude_session_${SID29}_tr.jsonl"
+mkdir -p "$SDIR29"; : > "$TR29"
+
+# Render 1: baseline, no compact in transcript → no Σ /compact line
+out29a=$(_compact_stdin "$SID29" 2.00 "$TR29" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_not_contains "R1 baseline: no /compact line yet" "/compact" "$out29a"
+
+# Render 2: first compact appears + cost jumps 2.00 → 2.30 (delta 0.30)
+_boundary "2026-06-06T22:00:00.000Z" >> "$TR29"
+out29b=$(_compact_stdin "$SID29" 2.30 "$TR29" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "R2 first compact: x1 \$0.300" "Σ /compact ×1: \$0.300" "$out29b"
+
+# Render 3: normal turn, cost rises 2.30 → 2.50, same floor → must NOT count
+out29c=$(_compact_stdin "$SID29" 2.50 "$TR29" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "R3 normal turn: still x1 \$0.300" "Σ /compact ×1: \$0.300" "$out29c"
+
+# Render 4: second compact + cost jumps 2.50 → 2.90 (delta 0.40) → x2 total 0.70
+_boundary "2026-06-06T22:05:00.000Z" >> "$TR29"
+out29d=$(_compact_stdin "$SID29" 2.90 "$TR29" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "R4 second compact: x2 \$0.700" "Σ /compact ×2: \$0.700" "$out29d"
+rm -f "$TR29"
+
+echo "--- Test 30: compact predating the feature is not retroactively counted"
+SID30="test-compact-pre-$$"
+SDIR30="/tmp/claude_session_${SID30}"
+TR30="/tmp/claude_session_${SID30}_tr.jsonl"
+mkdir -p "$SDIR30"
+# Transcript already has a boundary before the statusline's first-ever render
+_boundary "2026-06-06T21:00:00.000Z" > "$TR30"
+out30=$(_compact_stdin "$SID30" 5.00 "$TR30" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_not_contains "pre-existing compact not counted on first render" "/compact" "$out30"
+# A subsequent NEW compact is still counted (baseline now established)
+_boundary "2026-06-06T21:30:00.000Z" >> "$TR30"
+out30b=$(_compact_stdin "$SID30" 5.25 "$TR30" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "new compact after baseline: x1 \$0.250" "Σ /compact ×1: \$0.250" "$out30b"
+rm -f "$TR30"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="

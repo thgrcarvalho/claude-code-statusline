@@ -214,6 +214,32 @@ SESSION_COST="${STATE_DIR}/session_cost.txt"
 MODEL_BREAKDOWN="${STATE_DIR}/model_breakdown.txt"  # space-delimited: model in cr cw5m cw1h out
 
 now=$(date +%s)
+
+# /compact cost capture. Claude Code folds the /compact summarization cost into
+# cost.total_cost_usd (verified empirically: total_cost_usd steps up by the exact
+# compaction cost at the render where a new compact_boundary appears). The transcript
+# carries no cost fields, so the only source is the live harness total. We track the
+# harness total across renders and, the moment a new compact floor appears, attribute
+# the cost rise since the previous render to that compaction.
+# State (single line): "<count> <total_cost> <prev_cost> <prev_floor>"
+COMPACT_STATE="${STATE_DIR}/compact_cost.txt"
+_cc_now=$(echo "${cost:-0}" | awk '{printf "%.6f", $1+0}')
+_cc_floor="${compact_floor_ts:-0}"
+compact_count=0; compact_total=0; _cc_prev_cost=""; _cc_prev_floor=""
+if [ -f "$COMPACT_STATE" ]; then
+  read -r compact_count compact_total _cc_prev_cost _cc_prev_floor < "$COMPACT_STATE"
+fi
+compact_count="${compact_count:-0}"; compact_total="${compact_total:-0}"
+# Only count once we have a prior baseline (don't retroactively price compacts that
+# predate this feature — their deltas were never captured). A non-zero floor change
+# since the last render means a new compaction just completed.
+if [ -n "$_cc_prev_floor" ] && [ "$_cc_floor" != "$_cc_prev_floor" ] && [ "$_cc_floor" != "0" ]; then
+  _cc_delta=$(awk -v a="$_cc_now" -v b="${_cc_prev_cost:-$_cc_now}" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.6f", d}')
+  compact_count=$((compact_count + 1))
+  compact_total=$(awk -v a="$compact_total" -v b="$_cc_delta" 'BEGIN{printf "%.6f", a+b}')
+fi
+echo "${compact_count} ${compact_total} ${_cc_now} ${_cc_floor}" > "$COMPACT_STATE"
+
 prev_tout="-1"
 prev_ts=$now
 if [ -f "$LAST_STATE" ]; then
@@ -481,4 +507,13 @@ if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
   done < "$MODEL_BREAKDOWN"
   # Write local sum as fallback for when harness omits cost.total_cost_usd
   echo "$total_cost" > "$SESSION_COST"
+fi
+
+# Σ /compact line: cumulative cost of /compact summarizations this session.
+# Exact, not estimated — each value is the harness total_cost_usd delta captured
+# at the compact boundary (see the /compact cost capture above). Shown only once a
+# compaction has occurred while this feature was active.
+if [ "${compact_count:-0}" -gt 0 ]; then
+  printf "${DIM}Σ ${CYAN}/compact${RESET}${DIM} ×%s: ${YELLOW}%s${RESET}\n" \
+    "$compact_count" "$(fmt_c "$compact_total")"
 fi
