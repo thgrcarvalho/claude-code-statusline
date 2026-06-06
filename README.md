@@ -122,6 +122,8 @@ If you prefer to install by hand:
 
 If you've run the installer more than once, `uninstall.sh` lists all available backup timestamps and lets you choose which one to restore. It also handles the case where no prior statusline existed — removing the installed files and cleaning the `statusLine` key from `settings.json`.
 
+To stop backups from piling up, `install.sh` keeps only the **3 most recent backup generations** (each install is one generation, grouping that run's `statusline.sh`/`refresh-pricing.sh`/`settings.json` backups under a shared timestamp) and prunes older ones automatically. Adjust the `MAX_BACKUPS` variable near the top of `install.sh` to change the limit.
+
 ---
 
 ## How it works

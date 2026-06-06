@@ -5,6 +5,7 @@ INSTALL_DIR="$HOME/.claude"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETTINGS="$INSTALL_DIR/settings.json"
 CMD_PATH="$INSTALL_DIR/statusline.sh"
+MAX_BACKUPS=3   # keep only the most recent N backup generations; older ones are pruned on install
 
 # Pre-flight checks
 check_cmd() {
@@ -33,6 +34,17 @@ if [ -f "$SETTINGS" ]; then
   cp "$SETTINGS" "$SETTINGS.bak.$TS"
   echo "Backed up $SETTINGS  →  settings.json.bak.$TS"
 fi
+
+# Prune old backups: keep only the most recent $MAX_BACKUPS backup generations.
+# Each install writes <file>.bak.<TS> for several files sharing one timestamp, so we
+# dedupe to distinct timestamps, keep the newest $MAX_BACKUPS, and delete every file
+# belonging to the older ones. Portable: avoids GNU-only `head -n -N` (BSD/macOS lacks it).
+_old_ts=$(find "$INSTALL_DIR" -maxdepth 1 -name "*.bak.[0-9]*" 2>/dev/null \
+  | sed -E 's/.*\.bak\.([0-9]+)$/\1/' | sort -run | tail -n +$((MAX_BACKUPS + 1)))
+for ts in $_old_ts; do
+  rm -f "$INSTALL_DIR"/*.bak."$ts"
+  echo "Pruned old backup set: *.bak.$ts"
+done
 
 # Install scripts
 cp "$SCRIPT_DIR/statusline.sh"      "$INSTALL_DIR/"
