@@ -262,8 +262,8 @@ now=$(date +%s)
 # cost.total_cost_usd (verified empirically: total_cost_usd steps up by the exact
 # compaction cost at the render where a new compact_boundary appears). The transcript
 # carries no cost fields, so the only source is the live harness total. We track the
-# harness total across renders and, the moment a new compact floor appears, attribute
-# the cost rise since the previous render to that compaction.
+# harness total across renders and, when a new compact floor appears, attribute the cost
+# rise since the last completed turn to that compaction (see the baseline note below).
 # State (single line): "<count> <total_cost> <prev_cost> <prev_floor>"
 COMPACT_STATE="${STATE_DIR}/compact_cost.txt"
 _cc_now=$(echo "${cost:-0}" | awk '{printf "%.6f", $1+0}')
@@ -277,9 +277,25 @@ compact_count="${compact_count:-0}"; compact_total="${compact_total:-0}"
 # predate this feature — their deltas were never captured). A non-zero floor change
 # since the last render means a new compaction just completed.
 if [ -n "$_cc_prev_floor" ] && [ "$_cc_floor" != "$_cc_prev_floor" ] && [ "$_cc_floor" != "0" ]; then
-  _cc_delta=$(awk -v a="$_cc_now" -v b="${_cc_prev_cost:-$_cc_now}" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.6f", d}')
+  # Baseline = cost at the last completed turn, not the previous render. A long compaction
+  # (seconds to minutes) makes the harness bump total_cost_usd a render or two BEFORE the
+  # compact_boundary line lands in the transcript, so the previous render already shows the
+  # higher cost and a render-to-render delta collapses to 0. The last *turn* cost is a stable
+  # pre-compact anchor — nothing meaningful bills between a turn and a compaction except the
+  # compaction itself (plus negligible internal Haiku). LAST_STATE col 3 holds it; fall back
+  # to the previous render's cost for pre-upgrade sessions that haven't rewritten LAST_STATE.
+  _cc_base=$(cut -d: -f3 "$LAST_STATE" 2>/dev/null)
+  [ -z "$_cc_base" ] && _cc_base="${_cc_prev_cost:-$_cc_now}"
+  _cc_delta=$(awk -v a="$_cc_now" -v b="$_cc_base" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.6f", d}')
   compact_count=$((compact_count + 1))
   compact_total=$(awk -v a="$compact_total" -v b="$_cc_delta" 'BEGIN{printf "%.6f", a+b}')
+  # Advance the turn baseline (LAST_STATE col 3) to the post-compaction cost so a *subsequent*
+  # compaction with no real turn in between measures only its own incremental cost, not this
+  # one's again. Preserve cols 1-2 (tok_out, ts) so turn detection and the TTL base are intact.
+  if [ -f "$LAST_STATE" ]; then
+    _ls1=$(cut -d: -f1 "$LAST_STATE" 2>/dev/null); _ls2=$(cut -d: -f2 "$LAST_STATE" 2>/dev/null)
+    echo "${_ls1:-0}:${_ls2:-$now}:${_cc_now}" > "${LAST_STATE}.tmp" && mv "${LAST_STATE}.tmp" "$LAST_STATE"
+  fi
 fi
 echo "${compact_count} ${compact_total} ${_cc_now} ${_cc_floor}" > "${COMPACT_STATE}.tmp" \
   && mv "${COMPACT_STATE}.tmp" "$COMPACT_STATE"
@@ -292,7 +308,7 @@ if [ -f "$LAST_STATE" ]; then
 fi
 
 if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
-  echo "${tok_out}:${now}" > "$LAST_STATE"
+  echo "${tok_out}:${now}:${_cc_now}" > "$LAST_STATE"   # col 3 = harness cost at this turn (compact baseline)
   prev_ts=$now
 
   # Per-model breakdown from JSONL files (parent + sub-agents)

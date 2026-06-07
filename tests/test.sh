@@ -454,8 +454,8 @@ echo ""
 echo "=== /compact cost capture ==="
 
 # Helper: emit harness stdin with a given total_cost_usd and transcript path.
-_compact_stdin() { # $1=session_id  $2=cost  $3=transcript_path
-  printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-4-8","display_name":"Opus 4.8","provider":"anthropic"},"context_window":{"used_percentage":50,"context_window_size":1000000},"cost":{"total_cost_usd":%s},"current_usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":0,"output_tokens":50}}' "$1" "$3" "$2"
+_compact_stdin() { # $1=session_id  $2=cost  $3=transcript_path  $4=output_tokens (default 50)
+  printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-4-8","display_name":"Opus 4.8","provider":"anthropic"},"context_window":{"used_percentage":50,"context_window_size":1000000},"cost":{"total_cost_usd":%s},"current_usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":0,"output_tokens":%s}}' "$1" "$3" "$2" "${4:-50}"
 }
 _boundary() { # $1=iso_timestamp
   printf '{"type":"system","subtype":"compact_boundary","timestamp":"%s","compactMetadata":{"trigger":"manual","preTokens":79508,"postTokens":4450}}\n' "$1"
@@ -476,13 +476,15 @@ _boundary "2026-06-06T22:00:00.000Z" >> "$TR29"
 out29b=$(_compact_stdin "$SID29" 2.30 "$TR29" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
 assert_contains "R2 first compact: x1 \$0.300" "Σ /compact ×1: \$0.300" "$out29b"
 
-# Render 3: normal turn, cost rises 2.30 → 2.50, same floor → must NOT count
-out29c=$(_compact_stdin "$SID29" 2.50 "$TR29" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+# Render 3: a real normal turn (output_tokens changes 50→60), cost rises 2.30 → 2.50,
+# same floor → must NOT count, but advances the turn baseline used by the next compact
+out29c=$(_compact_stdin "$SID29" 2.50 "$TR29" 60 | bash "$SCRIPT" 2>/dev/null | strip_ansi)
 assert_contains "R3 normal turn: still x1 \$0.300" "Σ /compact ×1: \$0.300" "$out29c"
 
-# Render 4: second compact + cost jumps 2.50 → 2.90 (delta 0.40) → x2 total 0.70
+# Render 4: second compact (not a turn, output_tokens stays 60), cost 2.50 → 2.90
+# (delta from the R3 turn baseline = 0.40) → x2 total 0.70
 _boundary "2026-06-06T22:05:00.000Z" >> "$TR29"
-out29d=$(_compact_stdin "$SID29" 2.90 "$TR29" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+out29d=$(_compact_stdin "$SID29" 2.90 "$TR29" 60 | bash "$SCRIPT" 2>/dev/null | strip_ansi)
 assert_contains "R4 second compact: x2 \$0.700" "Σ /compact ×2: \$0.700" "$out29d"
 rm -f "$TR29"
 
@@ -500,6 +502,50 @@ _boundary "2026-06-06T21:30:00.000Z" >> "$TR30"
 out30b=$(_compact_stdin "$SID30" 5.25 "$TR30" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
 assert_contains "new compact after baseline: x1 \$0.250" "Σ /compact ×1: \$0.250" "$out30b"
 rm -f "$TR30"
+
+echo "--- Test 31: long-compaction lead race — cost rises a render before the boundary"
+# Regression for a slow /compact: the harness bumps total_cost_usd a render or two BEFORE
+# the compact_boundary line lands in the transcript. Baselining on the previous render then
+# sees the higher cost already and computes a 0 delta. Baselining on the last *turn* cost
+# captures it. (Old code produced "×1: $0" here; this is the bug fix.)
+SID31="test-compact-lead-$$"
+SDIR31="/tmp/claude_session_${SID31}"
+TR31="/tmp/claude_session_${SID31}_tr.jsonl"
+mkdir -p "$SDIR31"; : > "$TR31"
+# R1: a real turn at cost 3.00, no compaction yet → establishes the turn baseline
+out31a=$(_compact_stdin "$SID31" 3.00 "$TR31" 10 | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_not_contains "lead R1: no /compact yet" "/compact" "$out31a"
+# R2: cost jumps 3.00 → 3.50 (compaction billed early), boundary NOT landed, not a turn → no count
+out31b=$(_compact_stdin "$SID31" 3.50 "$TR31" 10 | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_not_contains "lead R2: cost rose pre-boundary, still no /compact" "/compact" "$out31b"
+# R3: boundary appears, cost unchanged 3.50, not a turn → delta measured from the last turn
+# (3.00) not the previous render (3.50) → x1 $0.500
+_boundary "2026-06-06T23:00:00.000Z" >> "$TR31"
+out31c=$(_compact_stdin "$SID31" 3.50 "$TR31" 10 | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "lead R3: captured from turn baseline x1 \$0.500" "Σ /compact ×1: \$0.500" "$out31c"
+rm -f "$TR31"
+
+echo "--- Test 32: consecutive compacts with no turn between → no double-count"
+# Two compactions and no real turn between them (output_tokens stays 50). The baseline must
+# advance to the post-compaction cost after the first, so the second measures only its own
+# delta. Without baseline advancement the second would re-measure from the original turn.
+SID32="test-compact-back2back-$$"
+SDIR32="/tmp/claude_session_${SID32}"
+TR32="/tmp/claude_session_${SID32}_tr.jsonl"
+mkdir -p "$SDIR32"; : > "$TR32"
+# R1: turn at cost 1.00, no compaction → turn baseline = 1.00
+out32a=$(_compact_stdin "$SID32" 1.00 "$TR32" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_not_contains "b2b R1: no /compact yet" "/compact" "$out32a"
+# R2: first compact, cost 1.00 → 1.40 (delta 0.40) → x1 $0.400
+_boundary "2026-06-06T23:30:00.000Z" >> "$TR32"
+out32b=$(_compact_stdin "$SID32" 1.40 "$TR32" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "b2b R2: x1 \$0.400" "Σ /compact ×1: \$0.400" "$out32b"
+# R3: second compact, no turn between, cost 1.40 → 1.60 (delta 0.20 from advanced baseline)
+# → x2 $0.600  (a non-advancing baseline would give 1.60-1.00=0.60 → x2 $1.000)
+_boundary "2026-06-06T23:35:00.000Z" >> "$TR32"
+out32c=$(_compact_stdin "$SID32" 1.60 "$TR32" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "b2b R3: x2 \$0.600 (no double-count)" "Σ /compact ×2: \$0.600" "$out32c"
+rm -f "$TR32"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
