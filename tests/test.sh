@@ -547,6 +547,43 @@ out32c=$(_compact_stdin "$SID32" 1.60 "$TR32" | bash "$SCRIPT" 2>/dev/null | str
 assert_contains "b2b R3: x2 \$0.600 (no double-count)" "Σ /compact ×2: \$0.600" "$out32c"
 rm -f "$TR32"
 
+# ─── Subagent collection ─────────────────────────────────────────────────────
+echo ""
+echo "=== subagent JSONL collection ==="
+
+echo "--- Test 33: subagent transcripts are collected recursively (workflow fleets nest)"
+# The per-model Σ folds subagents in. Inline Agent-tool subagents land directly in
+# subagents/agent-*.jsonl, but ultracode/Workflow fleets nest under
+# subagents/workflows/wf_*/agent-*.jsonl. A non-recursive glob silently dropped the
+# nested fleet, so its (often large) cost never showed in Σ. Build parent + inline +
+# nested-workflow transcripts with distinct token counts and assert the rebuilt
+# breakdown sums all three.
+SID33="test-subagent-recurse-$$"
+SDIR33="/tmp/claude_session_${SID33}"
+TDIR33="/tmp/test33-proj-$$"                       # holds <uuid>.jsonl and <uuid>/subagents/...
+UUID33="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+TR33="$TDIR33/${UUID33}.jsonl"
+SUB33="$TDIR33/${UUID33}/subagents"
+rm -rf "$SDIR33" "$TDIR33"
+mkdir -p "$SUB33/workflows/wf_test33"
+# parent: in 1000 / out 100
+printf '{"type":"assistant","uuid":"p33","message":{"role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":100}}}\n' > "$TR33"
+# inline (top-level) subagent: in 2000 / out 200
+printf '{"type":"assistant","uuid":"s33","message":{"role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":2000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":200}}}\n' > "$SUB33/agent-top.jsonl"
+# nested workflow subagent: in 4000 / out 400  (this is what the old non-recursive glob dropped)
+printf '{"type":"assistant","uuid":"w33","message":{"role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":4000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":400}}}\n' > "$SUB33/workflows/wf_test33/agent-nested.jsonl"
+# One render forces the turn-gated rebuild. Command substitution captures the script's
+# stdout, which keeps the pipe open until the backgrounded awk rebuild closes fd1 — so
+# model_breakdown.txt is guaranteed fresh by the time the render returns.
+_stdin33=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-4-8","display_name":"Opus 4.8","provider":"anthropic"},"context_window":{"used_percentage":50,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":50}}' "$SID33" "$TR33")
+_=$(echo "$_stdin33" | bash "$SCRIPT" 2>/dev/null)
+bd33=$(cat "$SDIR33/model_breakdown.txt" 2>/dev/null)
+# expected sum: in 1000+2000+4000=7000, out 100+200+400=700 (cr/cw all 0)
+assert_contains     "recursive collect sums parent+inline+nested" "claude-opus-4-8 7000 0 0 0 700 0 0" "$bd33"
+# guard: the old non-recursive result (nested fleet dropped) must NOT be what we get
+assert_not_contains "non-recursive sum (nested dropped) gone"      "claude-opus-4-8 3000 0 0 0 300 0 0" "$bd33"
+rm -rf "$SDIR33" "$TDIR33"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="

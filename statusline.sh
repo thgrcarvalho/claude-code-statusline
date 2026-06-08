@@ -317,12 +317,16 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
     project_dir=$(dirname "$transcript_path")
     subagent_dir="${project_dir}/${session_uuid}/subagents"
 
-    # Collect all files: parent JSONL + sub-agent JSONLs
+    # Collect all files: parent JSONL + sub-agent JSONLs (recursively).
+    # Subagents nest: inline Agent-tool subagents land in subagents/agent-*.jsonl,
+    # while ultracode/Workflow fleets land in subagents/workflows/wf_*/agent-*.jsonl.
+    # A non-recursive glob misses the nested fleets, so their (often large) cost never
+    # folds into the per-model Σ. find(1) catches every depth and is portable (BSD + GNU).
     jsonl_files=("$transcript_path")
     if [ -d "$subagent_dir" ]; then
-      for f in "$subagent_dir"/agent-*.jsonl; do
-        [ -e "$f" ] && jsonl_files+=("$f")
-      done
+      while IFS= read -r f; do
+        [ -n "$f" ] && jsonl_files+=("$f")
+      done < <(find "$subagent_dir" -type f -name 'agent-*.jsonl' 2>/dev/null)
     fi
 
     # Parse JSONL with awk: deduplicate by uuid, group by model, sum token counts
