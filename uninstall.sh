@@ -20,6 +20,9 @@ fi
 # ── If more than one backup, show list and let user pick ────────────────────
 TS_ARRAY=($TIMESTAMPS)
 if [ "${#TS_ARRAY[@]}" -gt 1 ]; then
+  # Negative subscripts (${arr[-1]}) need bash 4.3+; macOS ships bash 3.2, so
+  # index the last element explicitly for portability.
+  LAST_IDX=$((${#TS_ARRAY[@]} - 1))
   echo "Multiple installs found. Choose which backup to restore:"
   echo ""
   for ts in "${TS_ARRAY[@]}"; do
@@ -28,9 +31,9 @@ if [ "${#TS_ARRAY[@]}" -gt 1 ]; then
     echo "  [$ts]  $human"
   done
   echo ""
-  printf "Enter timestamp (or press Enter for most recent [%s]): " "${TS_ARRAY[-1]}"
+  printf "Enter timestamp (or press Enter for most recent [%s]): " "${TS_ARRAY[$LAST_IDX]}"
   read -r choice
-  TARGET_TS="${choice:-${TS_ARRAY[-1]}}"
+  TARGET_TS="${choice:-${TS_ARRAY[$LAST_IDX]}}"
 else
   TARGET_TS="${TS_ARRAY[0]}"
 fi
