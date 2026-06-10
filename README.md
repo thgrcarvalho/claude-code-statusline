@@ -41,7 +41,7 @@ Opus 4.7 │ ctx 14%/200k │ $0.42 / $0.65 │ ↑1 +87kr +2kw ↓312 │ hit 9
 - **`/compact` cost tracking** — a cumulative `Σ /compact ×N` row showing exactly what compaction has cost this session (`/clear` is free and shows nothing)
 - **Auto-updating pricing** — fetches latest rates from [LiteLLM's database](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json) once per day; covers all active and legacy Claude models with correct per-version rates
 - **Cache hit % and TTL countdown** — tells you how efficiently the cache is being used and when it might expire
-- **Hardcoded fallback rates** — works offline; if LiteLLM is unreachable the last-known rates stay in effect
+- **Hardcoded fallback rates** — works offline; if LiteLLM is unreachable the last-known rates stay in effect. Models LiteLLM doesn't list yet (e.g. Fable 5 at $10/$50 per Mtok) are covered by built-in family fallbacks
 - **Zero token cost** — reads from local JSONL files and `/tmp`, makes no API calls
 
 ---
@@ -194,7 +194,7 @@ All configuration is in `statusline.sh`. Common knobs:
 ./tests/test.sh
 ```
 
-Runs 80 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard, multiple `display_name` ambiguity, JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`, cache-write double-count regression, web-search counter propagation), recursive sub-agent collection (inline subagents plus nested `ultracode`/Workflow fleets, both folded into Σ), dual-cost top-line display (harness + local, fallback cases), dual-TTL display with 5m/1h token-count annotations, compact_boundary cache_log floor (pre-compact entries excluded), `/compact` cost capture (per-boundary delta accumulation, no double-counting on normal turns, no retroactive pricing of pre-feature compactions, the long-compaction lead race where the harness bumps cost before the boundary lands, and back-to-back compactions with no turn between), and an end-to-end render with Σ lines.
+Runs 88 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard, multiple `display_name` ambiguity, JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`, cache-write double-count regression, web-search counter propagation), recursive sub-agent collection (inline subagents plus nested `ultracode`/Workflow fleets, both folded into Σ), unknown-family models (Fable 5 with a `[1m]` context-beta id: cache_log filter, ctx/ttl freshness, Σ display name, pricing fallback), dual-cost top-line display (harness + local, fallback cases), dual-TTL display with 5m/1h token-count annotations, compact_boundary cache_log floor (pre-compact entries excluded), `/compact` cost capture (per-boundary delta accumulation, no double-counting on normal turns, no retroactive pricing of pre-feature compactions, the long-compaction lead race where the harness bumps cost before the boundary lands, and back-to-back compactions with no turn between), and an end-to-end render with Σ lines.
 
 CI runs automatically on every push and pull request via GitHub Actions (no extra dependencies — `jq` is intentionally absent to verify the no-jq path).
 

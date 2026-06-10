@@ -97,15 +97,16 @@ ctx_pct=$(echo "$ctx_pct" | awk '{printf "%d", $1 + 0.5}')
 # Handles all current and future Claude models without hardcoding versions.
 model_display() {
   local id="$1" family ver minor
+  id="${id%%\[*}"   # strip context-beta suffix: claude-fable-5[1m] → claude-fable-5
 
   # New-gen IDs: claude-{family}-{major}[-minor][-YYYYMMDD][...]
   # e.g. claude-opus-4-7-20260416  →  Opus 4.7
-  if [[ "$id" =~ ^claude-(opus|sonnet|haiku)-([0-9].*)$ ]]; then
+  if [[ "$id" =~ ^claude-(opus|sonnet|haiku|fable)-([0-9].*)$ ]]; then
     family="${BASH_REMATCH[1]}"
     ver="${BASH_REMATCH[2]}"
     ver=$(echo "$ver" | sed -E 's/-[0-9]{8}.*//')  # strip date suffix
     ver="${ver//-/.}"                                # hyphens → dots
-    case "$family" in opus) family="Opus";; sonnet) family="Sonnet";; haiku) family="Haiku";; esac
+    case "$family" in opus) family="Opus";; sonnet) family="Sonnet";; haiku) family="Haiku";; fable) family="Fable";; esac
     echo "$family $ver"
     return
   fi
@@ -131,7 +132,7 @@ pricing_for() {
   local cache="/tmp/claude_pricing.txt"
   local model_id="$1"
   local norm_id
-  norm_id=$(echo "$model_id" | sed -E 's|^anthropic/||; s|-[0-9]{8}$||')
+  norm_id=$(echo "$model_id" | sed -E 's|^anthropic/||; s|\[[^]]*\]$||; s|-[0-9]{8}$||')
 
   if [ -f "$cache" ]; then
     local rates
@@ -142,11 +143,14 @@ pricing_for() {
     fi
   fi
 
-  # Fallback: family pattern match on the original model id
+  # Fallback: family pattern match on the original model id.
+  # Fable is hardcoded because LiteLLM does not list it yet (checked 2026-06):
+  # official rates are $10/$50 per Mtok (docs.anthropic.com/en/docs/about-claude/pricing).
   case "$model_id" in
     *opus*|*Opus*)     echo "5.00 25.00" ;;
     *sonnet*|*Sonnet*) echo "3.00 15.00" ;;
     *haiku*|*Haiku*)   echo "1.00 5.00"  ;;
+    *fable*|*Fable*)   echo "10.00 50.00" ;;
     *)                 echo "3.00 15.00" ;;
   esac
 }
@@ -404,7 +408,9 @@ END {
   # Format per line: "<unix_ts> <cw5m> <cw1h> <model_id> <cached_now> <ctx_pct> <ctx_kb>". Entries older than 1h are pruned.
   # Each model (Opus, Sonnet, etc.) has a separate cache at Anthropic; we tag entries
   # with the model so that alive sums are filtered to the currently active model only.
-  turn_cw5m=0; turn_cw1h=0; turn_model_id="${model_id:-unknown}"
+  # Tag fallback: stdin model.id may carry a [1m] context-beta suffix the transcript id
+  # lacks; strip it so every cache_log entry for the model shares one comparable tag.
+  turn_cw5m=0; turn_cw1h=0; turn_model_id="${model_id%%\[*}"; turn_model_id="${turn_model_id:-unknown}"
   if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
     _last=$(grep '"role":"assistant"' "$transcript_path" 2>/dev/null | grep '"usage"' | tail -1)
     if echo "$_last" | grep -qF '"ephemeral_5m_input_tokens"' 2>/dev/null; then
@@ -435,7 +441,11 @@ case "$model" in
   Opus*)   _cache_filter="claude-opus" ;;
   Sonnet*) _cache_filter="claude-sonnet" ;;
   Haiku*)  _cache_filter="claude-haiku" ;;
-  *)       _cache_filter="$model_id" ;;  # best effort for unknown display names
+  Fable*)  _cache_filter="claude-fable" ;;
+  *)       _cache_filter="${model_id%%\[*}" ;;  # best effort for unknown display names;
+           # strip a [1m]-style context-beta suffix — the stdin id carries it but the
+           # transcript model (used to tag cache_log entries) does not, so an unstripped
+           # filter matches no (or only stale fallback-tagged) entries → frozen ttl/ctx.
 esac
 model_last_ts=0; model_last_is_1h=0; model_last_cached=0
 model_last_ctx_pct=""; model_last_ctx_kb=""
