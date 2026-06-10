@@ -584,6 +584,47 @@ assert_contains     "recursive collect sums parent+inline+nested" "claude-opus-4
 assert_not_contains "non-recursive sum (nested dropped) gone"      "claude-opus-4-8 3000 0 0 0 300 0 0" "$bd33"
 rm -rf "$SDIR33" "$TDIR33"
 
+# ─── Unknown-family model (Fable) ────────────────────────────────────────────
+echo ""
+echo "=== unknown-family model (Fable 5) ==="
+
+echo "--- Test 34: Fable 5 with [1m] stdin id — ttl filter, ctx override, Σ display, pricing"
+# Fable is not an Opus/Sonnet/Haiku display name, so _cache_filter used to fall back to
+# the raw stdin id "claude-fable-5[1m]". Transcript-extracted cache_log tags lack the
+# [1m] suffix, so only the stale first-turn fallback entry (tagged with the raw id)
+# matched → frozen ttl base ("expired"), stale cached count, stale ctx%. Σ rows showed
+# the raw id (no display mapping) and billed at the $3/$15 default (no fable pricing).
+SID34="test-fable-$$"
+SDIR34="/tmp/claude_session_${SID34}"
+rm -rf "$SDIR34"; mkdir -p "$SDIR34"
+_now34=$(date +%s)
+# Suppress the turn-gate (tok_out=50 matches last_api col 1) so the prewritten
+# breakdown and cache_log survive the render untouched.
+echo "50:${_now34}" > "$SDIR34/last_api.ts"
+# cache_log: stale first-turn entry tagged with the raw [1m] id (no tier split, 25k
+# cached, ctx 3%), then a fresh transcript-tagged entry (1h tier, 73k cached, ctx 7%).
+# The fixed family filter ("claude-fable") must pick the fresh one.
+{
+  echo "$((_now34 - 3000)) 0 0 claude-fable-5[1m] 25312 3 1000"
+  echo "$((_now34 - 20)) 0 6801 claude-fable-5 73499 7 1000"
+} > "$SDIR34/cache_log.txt"
+# Σ input: token sums from a real Fable session; the $10/$50 fable fallback prices this
+# at $3.73 (the old $3/$15 default gave $1.12). If this assertion ever fails on the cost
+# value, LiteLLM has likely added claude-fable-5 with different rates — re-check pricing.
+echo "claude-fable-5 7966 395502 0 69712 37272 0 0" > "$SDIR34/model_breakdown.txt"
+_stdin34=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-fable-5[1m]","display_name":"Fable 5","provider":"anthropic"},"context_window":{"used_percentage":3,"context_window_size":1000000},"current_usage":{"input_tokens":2,"cache_read_input_tokens":54000,"cache_creation_input_tokens":37,"output_tokens":50}}' "$SID34")
+out34=$(echo "$_stdin34" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+l1_34=$(echo "$out34" | head -1)
+assert_contains     "ttl annotation = fresh entry (73k)"    "(73k)"    "$l1_34"
+assert_not_contains "stale [1m]-entry 25k gone"             "(25k)"    "$l1_34"
+assert_contains     "1h tier countdown (0:59:..)"           "0:59:"    "$l1_34"
+assert_not_contains "ttl not expired"                       "expired"  "$l1_34"
+assert_contains     "ctx override from fresh entry (7%)"    "ctx 7%"   "$l1_34"
+assert_not_contains "stale ctx 3% gone"                     "ctx 3%"   "$l1_34"
+assert_contains     "Σ row uses display name Fable 5"       "Fable 5:" "$out34"
+assert_contains     "fable fallback pricing 10/50 → \$3.73" "\$3.73"   "$out34"
+rm -rf "$SDIR34"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
