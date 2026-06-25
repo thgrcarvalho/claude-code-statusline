@@ -697,6 +697,38 @@ assert_contains "exits non-zero"                  "exit:1"                      
 assert_eq       "settings.json left untouched"    "$_settings37"  "$(cat "$H37/.claude/settings.json")"
 rm -rf "$SRC37" "$H37"
 
+# ─── Corrupt cache_log resilience ────────────────────────────────────────────
+echo ""
+echo "=== corrupt cache_log resilience ==="
+
+echo "--- Test 38: a poisoned cache_log entry can't wedge the ctx display"
+# An old/garbled statusline.sh meeting a newer stdin schema wrote bogus values into the ctx
+# columns of cache_log (e.g. a 18-digit "percentage"). The per-model ctx override trusted it,
+# so the live status line showed `ctx 251782361782363775%/…` until /tmp was cleared by hand.
+# The read-path guard must IGNORE such an entry (ctx falls back to the parsed stdin value), and
+# the prune-path must PURGE it on the next turn.
+_pstdin() { printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-4-8","display_name":"Opus 4.8"},"context_window":{"context_window_size":1000000,"current_usage":{"input_tokens":2,"output_tokens":5951,"cache_creation_input_tokens":5000,"cache_read_input_tokens":242636},"used_percentage":23}}' "$1"; }
+_NOW=$(date +%s)
+_POISON="${_NOW} 0 5000 claude-opus-4-8 242636 251782361782363775 242484 0 claude-opus-4-8 242636"
+# (a) poison present, turn-gate suppressed → read-path guard ignores it, ctx from stdin (23%)
+SID38a="test-poison-read-$$"; SDIR38a="/tmp/claude_session_${SID38a}"; rm -rf "$SDIR38a"; mkdir -p "$SDIR38a"
+echo "5951:${_NOW}" > "$SDIR38a/last_api.ts"      # tok_out 5951 matches → no new turn
+echo "$_POISON" > "$SDIR38a/cache_log.txt"
+out38a=$(_pstdin "$SID38a" | bash "$SCRIPT" 2>/dev/null | strip_ansi | head -1)
+assert_contains     "read-path: ctx falls back to stdin (23%)"   "ctx 23%"               "$out38a"
+assert_not_contains "read-path: bogus 18-digit pct gone"         "251782361782363775"    "$out38a"
+assert_not_contains "read-path: leaked model token gone"         "claude-opus-4-8 242636" "$out38a"
+rm -rf "$SDIR38a"
+# (b) poison present, new turn fires → prune-path drops the corrupt line
+SID38b="test-poison-prune-$$"; SDIR38b="/tmp/claude_session_${SID38b}"; rm -rf "$SDIR38b"; mkdir -p "$SDIR38b"
+echo "1:1" > "$SDIR38b/last_api.ts"               # tok_out 5951 != 1 → new turn
+echo "$_POISON" > "$SDIR38b/cache_log.txt"
+_pstdin "$SID38b" | bash "$SCRIPT" >/dev/null 2>&1
+cl38=$(cat "$SDIR38b/cache_log.txt" 2>/dev/null)
+assert_not_contains "prune-path: poison line purged"       "251782361782363775" "$cl38"
+assert_contains     "prune-path: clean fresh entry written" "claude-opus-4-8 247636 23 1000" "$cl38"
+rm -rf "$SDIR38b"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
