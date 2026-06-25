@@ -438,7 +438,19 @@ END {
   fi
   {
     while IFS=' ' read -r _ts _5 _1 _m _c _cp _ck; do
-      [ "$((_ts + 3600 - now))" -gt 0 ] && echo "$_ts $_5 $_1 $_m ${_c:-0} ${_cp:-0} ${_ck:-0}"
+      # Carry forward only well-formed entries within the last hour. Dropping malformed lines
+      # here purges any poison a garbled parser wrote, so the corruption can't persist past the
+      # next turn. Every numeric column must be a plain integer (a multi-token _ck — extra
+      # trailing fields from a corrupt line — contains a space and fails this), the model tag
+      # must be present, and ctx must be in range.
+      [ -z "$_m" ] && continue
+      _bad=0
+      for _v in "$_ts" "$_5" "$_1" "$_c" "$_cp" "$_ck"; do
+        case "$_v" in ''|*[!0-9]*) _bad=1; break ;; esac
+      done
+      [ "$_bad" = 1 ] && continue
+      { [ "$_cp" -le 100 ] && [ "$_ck" -le 100000 ]; } || continue
+      [ "$((_ts + 3600 - now))" -gt 0 ] && echo "$_ts $_5 $_1 $_m $_c $_cp $_ck"
     done < "${STATE_DIR}/cache_log.txt" 2>/dev/null
     echo "${now} ${turn_cw5m} ${turn_cw1h} ${turn_model_id} ${cached_now} ${turn_ctx_pct} ${turn_ctx_kb}"
   } > "${STATE_DIR}/cache_log.txt.tmp" 2>/dev/null && \
@@ -465,19 +477,28 @@ if [ -f "${STATE_DIR}/cache_log.txt" ]; then
   while IFS=' ' read -r _ts _5 _1 _m _c _cp _ck; do
     # Skip entries from a different model; skip old 3-column entries (no model tag)
     [ -z "$_m" ] && continue
+    # Reject corrupt entries. A garbled parser (e.g. an old statusline.sh meeting a newer
+    # stdin schema) can write a bogus huge value here; without this guard such an entry would
+    # win the "most recent" test below and wedge the ctx display indefinitely — clearing /tmp
+    # was the only recovery. _ts must be a plain integer and not implausibly far in the future.
+    case "$_ts" in ''|*[!0-9]*) continue ;; esac
+    [ "$_ts" -gt "$((now + 300))" ] && continue
     # Skip entries that predate the last /compact — that cache no longer exists at Anthropic
     [ "$_ts" -lt "$compact_floor_ts" ] && continue
     case "$_m" in
       "${_cache_filter}"*) ;;
       *) continue ;;
     esac
-    if [ "$_ts" -gt "$model_last_ts" ]; then
-      model_last_ts=$_ts
-      [ "${_1:-0}" -gt 0 ] && model_last_is_1h=1 || model_last_is_1h=0
-      model_last_cached=${_c:-0}
-      model_last_ctx_pct=${_cp:-}
-      model_last_ctx_kb=${_ck:-}
-    fi
+    [ "$_ts" -le "$model_last_ts" ] && continue
+    model_last_ts=$_ts
+    case "$_1" in ''|*[!0-9]*) model_last_is_1h=0 ;; *) [ "$_1" -gt 0 ] && model_last_is_1h=1 || model_last_is_1h=0 ;; esac
+    case "$_c" in ''|*[!0-9]*) model_last_cached=0 ;; *) model_last_cached=$_c ;; esac
+    # Adopt stored ctx only when sane: pct in 0..100, kb a plain int within a generous bound.
+    # Otherwise leave them empty so the override below is skipped and ctx keeps the freshly
+    # parsed stdin value — corrupt state can never clobber a correct live read.
+    model_last_ctx_pct=""; model_last_ctx_kb=""
+    case "$_cp" in ''|*[!0-9]*) ;; *) [ "$_cp" -le 100 ]    && model_last_ctx_pct=$_cp ;; esac
+    case "$_ck" in ''|*[!0-9]*) ;; *) [ "$_ck" -le 100000 ] && model_last_ctx_kb=$_ck ;; esac
   done < "${STATE_DIR}/cache_log.txt"
 fi
 
