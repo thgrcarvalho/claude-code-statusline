@@ -26,9 +26,14 @@ iso_to_epoch() {
 # Extract every stdin field in ONE awk pass (was ~11 grep|sed pipelines ≈ 55 forks per render).
 # Handles compact and pretty-printed JSON by joining all input into one buffer, then matching by
 # exact key name. display_name/id are scoped to the model section (effort/output_style also carry
-# display_name); numeric keys are unambiguous because the leading quote in the pattern stops
-# "input_tokens" from matching "cache_*_input_tokens". Emits 11 newline-separated values in a
-# fixed order — empty when a key is absent, so the reads below stay in sync.
+# display_name); used_percentage/context_window_size are scoped to the context_window section
+# (Claude Code 2.1.187+ added a rate_limits block whose five_hour/seven_day tiers ALSO carry
+# used_percentage — a whole-buffer match would grab a rate-limit % whenever rate_limits is
+# serialized before context_window). Token keys stay whole-buffer: current_usage was top-level
+# pre-2.1.187 and nested under context_window after, and a buffer-wide first match by exact key
+# (the leading quote stops "input_tokens" matching "cache_*_input_tokens" or "total_input_tokens")
+# finds the right value under both layouts. Emits 11 newline-separated values in a fixed order —
+# empty when a key is absent, so the reads below stay in sync.
 {
   read -r model
   read -r model_id
@@ -61,10 +66,17 @@ function nval(s, key,   m) {
 END {
   mi = index(buf, "\"model\"")
   mseg = (mi > 0) ? substr(buf, mi) : ""
-  size = nval(buf, "context_window_size")
+  # Scope to the context_window object so a rate_limits.*.used_percentage (CC 2.1.187+)
+  # can never win. index() finds the real "context_window" key, not "context_window_size"
+  # (the trailing quote in the search string stops that), and substr from there excludes any
+  # rate_limits block serialized earlier. Falls back to the whole buffer when the key is
+  # absent, preserving pre-2.1.187 behavior.
+  ci = index(buf, "\"context_window\"")
+  cwseg = (ci > 0) ? substr(buf, ci) : buf
+  size = nval(cwseg, "context_window_size")
   print sval(mseg, "display_name")
   print sval(mseg, "id")
-  print nval(buf, "used_percentage")
+  print nval(cwseg, "used_percentage")
   print (size == "" ? "" : int(size / 1000))
   print nval(buf, "total_cost_usd")
   print nval(buf, "input_tokens")

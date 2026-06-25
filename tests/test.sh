@@ -625,6 +625,28 @@ assert_contains     "Σ row uses display name Fable 5"       "Fable 5:" "$out34"
 assert_contains     "fable fallback pricing 10/50 → \$3.73" "\$3.73"   "$out34"
 rm -rf "$SDIR34"
 
+# ─── New stdin schema (Claude Code 2.1.187+) ─────────────────────────────────
+echo ""
+echo "=== new stdin schema (CC 2.1.187+) ==="
+
+echo "--- Test 35: nested current_usage + rate_limits.used_percentage disambiguation"
+# CC 2.1.187+ moved current_usage INSIDE context_window and added a rate_limits block whose
+# five_hour/seven_day tiers each carry their own used_percentage. The fixture serializes
+# rate_limits BEFORE context_window on purpose: a whole-buffer "used_percentage" match would
+# grab the five_hour value (18) instead of the real context 33% — this is the class of bug
+# that garbled the status line on newer CLIs. Extraction is now scoped to the context_window
+# object, so ctx must read 33%, and the nested current_usage tokens must still be summed.
+out35=$(cat "$FIXTURES/stdin-new-schema.json" | bash "$SCRIPT" 2>/dev/null | strip_ansi)
+l1_35=$(echo "$out35" | head -1)
+assert_contains     "ctx from context_window (33%)"        "ctx 33%"               "$l1_35"
+assert_not_contains "rate_limits five_hour % not used"     "ctx 18%"               "$l1_35"
+assert_not_contains "rate_limits seven_day % not used"     "ctx 54%"               "$l1_35"
+assert_contains     "context_window_size → /1000k"         "/1000k"                "$l1_35"
+assert_contains     "1M-context display name passes through" "Opus 4.8 (1M context)" "$l1_35"
+assert_contains     "nested current_usage cache_read (324k)" "+324kr"               "$l1_35"
+assert_not_contains "resets_at timestamp not leaked into line" "1782366000"         "$l1_35"
+rm -rf /tmp/claude_session_test-newschema
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
