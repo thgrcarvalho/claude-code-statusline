@@ -1,0 +1,29 @@
+{
+  "session_id": "test-newschema",
+  "transcript_path": "/dev/null",
+  "cwd": "/home/user/proj",
+  "effort": { "level": "xhigh" },
+  "model": { "id": "claude-opus-4-8", "display_name": "Opus 4.8 (1M context)" },
+  "version": "2.1.187",
+  "output_style": { "name": "default" },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 18, "resets_at": 1782366000 },
+    "seven_day": { "used_percentage": 54, "resets_at": 1782432000 }
+  },
+  "cost": { "total_cost_usd": 46.02, "total_lines_added": 10, "total_lines_removed": 2 },
+  "context_window": {
+    "total_input_tokens": 980000,
+    "total_output_tokens": 2000,
+    "context_window_size": 1000000,
+    "current_usage": {
+      "input_tokens": 2,
+      "output_tokens": 2000,
+      "cache_creation_input_tokens": 1500,
+      "cache_read_input_tokens": 324000
+    },
+    "used_percentage": 33,
+    "remaining_percentage": 67
+  },
+  "exceeds_200k_tokens": true,
+  "thinking": { "enabled": true }
+}
