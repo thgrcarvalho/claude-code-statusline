@@ -61,30 +61,60 @@ for f in "${INSTALLED_FILES[@]}"; do
   fi
 done
 
-# ── Restore settings.json ──────────────────────────────────────────────────
+# ── Restore ONLY the statusLine key in settings.json ───────────────────────
+# NEVER restore a whole settings.json backup: a stale full file silently wipes unrelated keys
+# added since install and can break the CLI. We only ever touch the statusLine key — restoring
+# the exact previous value (captured at install) or, if there was none / no record, removing
+# just the key we added. Any legacy settings.json.bak.<ts> full-file backup is left untouched.
 SETTINGS="$INSTALL_DIR/settings.json"
-BAK_SETTINGS="$SETTINGS.bak.$TARGET_TS"
+SL_BAK="$SETTINGS.statusLine.bak.$TARGET_TS"
 
-if [ -f "$BAK_SETTINGS" ]; then
-  cp "$BAK_SETTINGS" "$SETTINGS"
-  echo "  Restored  $SETTINGS"
-else
-  # settings.json didn't exist before — remove the statusLine key we added
-  if [ -f "$SETTINGS" ]; then
-    if command -v jq >/dev/null 2>&1; then
-      jq 'del(.statusLine)' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
-      echo "  Removed statusLine key from $SETTINGS"
-    elif command -v python3 >/dev/null 2>&1; then
-      python3 - "$SETTINGS" <<'PY'
+_remove_statusline() {
+  if command -v jq >/dev/null 2>&1; then
+    jq 'del(.statusLine)' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$SETTINGS" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f: d = json.load(f)
 d.pop('statusLine', None)
 with open(sys.argv[1], 'w') as f: json.dump(d, f, indent=2)
 PY
-      echo "  Removed statusLine key from $SETTINGS"
+  else
+    echo "  Note: neither jq nor python3 found — remove the 'statusLine' key from $SETTINGS manually."
+    return 1
+  fi
+}
+
+_restore_statusline() {
+  if command -v jq >/dev/null 2>&1; then
+    jq --argjson sl "$(cat "$SL_BAK")" '.statusLine = $sl' "$SETTINGS" > "$SETTINGS.tmp" \
+      && mv "$SETTINGS.tmp" "$SETTINGS"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$SETTINGS" "$SL_BAK" <<'PY'
+import json, sys
+settings, valfile = sys.argv[1], sys.argv[2]
+with open(settings) as f: d = json.load(f)
+with open(valfile) as f: d['statusLine'] = json.load(f)
+with open(settings, 'w') as f: json.dump(d, f, indent=2)
+PY
+  else
+    echo "  Note: neither jq nor python3 found — restore the 'statusLine' key in $SETTINGS manually."
+    return 1
+  fi
+}
+
+if [ -f "$SETTINGS" ]; then
+  if [ -f "$SL_BAK" ]; then
+    _prev=$(cat "$SL_BAK" 2>/dev/null)
+    if [ -z "$_prev" ] || [ "$_prev" = "null" ]; then
+      _remove_statusline && echo "  Removed statusLine key from $SETTINGS (none before install)"
     else
-      echo "  Note: remove the 'statusLine' key from $SETTINGS manually."
+      _restore_statusline && echo "  Restored previous statusLine value in $SETTINGS"
     fi
+  else
+    # No saved value for this generation (older install format, or first-ever install) —
+    # safest action is to remove just the statusLine key. All other keys are left intact.
+    _remove_statusline && echo "  Removed statusLine key from $SETTINGS"
   fi
 fi
 

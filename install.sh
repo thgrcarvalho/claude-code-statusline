@@ -30,10 +30,10 @@ for f in statusline.sh refresh-pricing.sh; do
     echo "Backed up $INSTALL_DIR/$f  →  $f.bak.$TS"
   fi
 done
-if [ -f "$SETTINGS" ]; then
-  cp "$SETTINGS" "$SETTINGS.bak.$TS"
-  echo "Backed up $SETTINGS  →  settings.json.bak.$TS"
-fi
+# NOTE: we deliberately do NOT back up the whole settings.json. The previous statusLine
+# *value* (only that key) is captured just before patching, below. uninstall restores only
+# that key — restoring a stale full settings.json can silently wipe unrelated keys added
+# since install and break the CLI.
 
 # Prune old backups: keep only the most recent $MAX_BACKUPS backup generations.
 # Each install writes <file>.bak.<TS> for several files sharing one timestamp, so we
@@ -51,6 +51,29 @@ cp "$SCRIPT_DIR/statusline.sh"      "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/refresh-pricing.sh" "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR/statusline.sh" "$INSTALL_DIR/refresh-pricing.sh"
 echo "Installed scripts to $INSTALL_DIR/"
+
+# Capture the PRIOR statusLine value (only that key) so uninstall can restore exactly it —
+# never the whole settings.json. Writes the JSON value compactly, or `null` if statusLine was
+# absent (uninstall reads `null` as "delete the key we added"). Keyed by the install timestamp
+# so it shares a backup generation with the script-file backups above.
+_backup_statusline_value() {
+  local out="$SETTINGS.statusLine.bak.$TS"
+  if command -v jq >/dev/null 2>&1; then
+    jq -c '.statusLine // null' "$SETTINGS" > "$out" 2>/dev/null \
+      && echo "Saved previous statusLine value  →  $(basename "$out")"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$SETTINGS" "$out" <<'PY' \
+      && echo "Saved previous statusLine value  →  $(basename "$out")"
+import json, sys
+src, out = sys.argv[1], sys.argv[2]
+try:
+    with open(src) as f: d = json.load(f)
+except Exception:
+    d = {}
+with open(out, 'w') as f: json.dump(d.get('statusLine', None), f)
+PY
+  fi
+}
 
 # Patch ~/.claude/settings.json (use jq or python3 if available; else print manual instructions)
 _patch_settings() {
@@ -78,6 +101,7 @@ PY
 }
 
 if [ -f "$SETTINGS" ]; then
+  _backup_statusline_value
   _patch_settings
 else
   printf '{"statusLine":{"type":"command","command":"%s","refreshInterval":1}}\n' "$CMD_PATH" > "$SETTINGS"

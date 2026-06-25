@@ -647,6 +647,39 @@ assert_contains     "nested current_usage cache_read (324k)" "+324kr"           
 assert_not_contains "resets_at timestamp not leaked into line" "1782366000"         "$l1_35"
 rm -rf /tmp/claude_session_test-newschema
 
+# ─── install / uninstall settings.json safety ────────────────────────────────
+echo ""
+echo "=== install/uninstall settings safety ==="
+
+echo "--- Test 36: uninstall touches only the statusLine key, never the whole settings.json"
+# Regression for the footgun where uninstall restored a full settings.json backup and wiped
+# unrelated keys (could break the CLI). install/uninstall must read/write ONLY .statusLine.
+# Runs the real install.sh + uninstall.sh in a throwaway HOME. Needs jq to assert; skip if absent.
+if command -v jq >/dev/null 2>&1; then
+  touch /tmp/claude_pricing.txt 2>/dev/null   # fresh cache → refresh-pricing.sh exits early (no network)
+  # CASE A: a prior custom statusLine + unrelated keys → uninstall restores the OLD statusLine verbatim
+  HA="/tmp/sltest-a-$$"; rm -rf "$HA"; mkdir -p "$HA/.claude"
+  printf '%s' '{"model":"opus","permissions":{"allow":["Bash"]},"statusLine":{"type":"command","command":"/old/sl.sh","refreshInterval":5}}' > "$HA/.claude/settings.json"
+  HOME="$HA" bash "$ROOT/install.sh" >/dev/null 2>&1
+  a_installed=$(jq -r '.statusLine.command' "$HA/.claude/settings.json" 2>/dev/null)
+  HOME="$HA" bash "$ROOT/uninstall.sh" >/dev/null 2>&1 </dev/null
+  assert_contains "A: install repoints statusLine into HOME" "$HA/.claude/statusline.sh" "$a_installed"
+  assert_eq "A: uninstall restores prior statusLine verbatim" '"/old/sl.sh"'       "$(jq -c '.statusLine.command' "$HA/.claude/settings.json" 2>/dev/null)"
+  assert_eq "A: unrelated model key preserved"                '"opus"'             "$(jq -c '.model' "$HA/.claude/settings.json" 2>/dev/null)"
+  assert_eq "A: unrelated permissions preserved"              '{"allow":["Bash"]}' "$(jq -c '.permissions' "$HA/.claude/settings.json" 2>/dev/null)"
+  rm -rf "$HA"
+  # CASE B: no prior statusLine → uninstall removes just the key, leaves the rest intact
+  HB="/tmp/sltest-b-$$"; rm -rf "$HB"; mkdir -p "$HB/.claude"
+  printf '%s' '{"model":"opus","permissions":{"allow":["Bash"]}}' > "$HB/.claude/settings.json"
+  HOME="$HB" bash "$ROOT/install.sh" >/dev/null 2>&1
+  HOME="$HB" bash "$ROOT/uninstall.sh" >/dev/null 2>&1 </dev/null
+  assert_eq "B: statusLine key removed (none before install)" 'false'  "$(jq 'has("statusLine")' "$HB/.claude/settings.json" 2>/dev/null)"
+  assert_eq "B: unrelated model key preserved"                '"opus"' "$(jq -c '.model' "$HB/.claude/settings.json" 2>/dev/null)"
+  rm -rf "$HB"
+else
+  echo "  (skipped: jq not available to assert settings contents)"
+fi
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
