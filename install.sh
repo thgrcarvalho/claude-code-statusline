@@ -14,6 +14,19 @@ check_cmd() {
 check_cmd curl "macOS: pre-installed  |  Linux: apt install curl"
 # jq is optional: enables auto-pricing updates from LiteLLM; statusline works without it
 
+# Verify the source files we're about to install exist BEFORE touching anything. statusline.sh
+# can go missing from the working tree (e.g. deleted by hand), and a plain `git pull` won't
+# restore a file the incoming commits didn't modify — leaving a cryptic mid-run `cp: No such
+# file`. Fail early with the exact recovery command instead, before any backup or settings edit.
+for f in statusline.sh refresh-pricing.sh; do
+  if [ ! -f "$SCRIPT_DIR/$f" ]; then
+    echo "Error: $f is missing from $SCRIPT_DIR"
+    echo "  It's tracked in git but absent from your working copy. Restore it and re-run:"
+    echo "    git checkout -- $f && ./install.sh"
+    exit 1
+  fi
+done
+
 # Warn on bash < 4 (scripts work on 3.2 but bash 4+ is recommended)
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   echo "Warning: bash ${BASH_VERSION} detected. Scripts work on bash 3.2+ but bash 4+ is recommended."
