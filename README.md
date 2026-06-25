@@ -65,10 +65,12 @@ cd claude-code-statusline
 
 The installer will:
 1. Check for `jq` and `curl`
-2. Back up any existing `~/.claude/statusline.sh` and `~/.claude/settings.json`
+2. Back up any existing `~/.claude/statusline.sh`, and record your current `statusLine` **value** so it can be restored later
 3. Copy scripts to `~/.claude/` and make them executable
-4. Patch `~/.claude/settings.json` to activate the statusline
+4. Patch **only** the `statusLine` key in `~/.claude/settings.json` to activate the statusline
 5. Fetch the initial pricing cache from LiteLLM
+
+> **Your other settings are never touched.** Install and uninstall only ever read or write the single `statusLine` key — the rest of `settings.json` is left exactly as-is. The installer does **not** copy your whole `settings.json` to a backup, so uninstall can never restore a stale full file over settings you've changed since.
 
 Then **restart Claude Code**. The new statusline appears immediately.
 
@@ -114,15 +116,15 @@ If you prefer to install by hand:
 
 ## Uninstall / Revert
 
-`install.sh` creates timestamped backups of anything it overwrites (`~/.claude/statusline.sh.bak.<ts>`, `~/.claude/settings.json.bak.<ts>`, etc.). To go back:
+`install.sh` creates timestamped backups of the scripts it overwrites (`~/.claude/statusline.sh.bak.<ts>`, `~/.claude/refresh-pricing.sh.bak.<ts>`) and records your prior `statusLine` **value** (`~/.claude/settings.json.statusLine.bak.<ts>`). To go back:
 
 ```bash
 ./uninstall.sh
 ```
 
-If you've run the installer more than once, `uninstall.sh` lists all available backup timestamps and lets you choose which one to restore. It also handles the case where no prior statusline existed — removing the installed files and cleaning the `statusLine` key from `settings.json`.
+`uninstall.sh` restores the previous scripts and **the `statusLine` key only** — putting back exactly the value you had before (or removing the key entirely if you had no statusline before). Every other key in `settings.json` is left untouched. It **never** overwrites your whole `settings.json` from a backup, so it can't wipe settings you've added since installing. If you've run the installer more than once, it lists the available timestamps and lets you pick which generation to revert to.
 
-To stop backups from piling up, `install.sh` keeps only the **3 most recent backup generations** (each install is one generation, grouping that run's `statusline.sh`/`refresh-pricing.sh`/`settings.json` backups under a shared timestamp) and prunes older ones automatically. Adjust the `MAX_BACKUPS` variable near the top of `install.sh` to change the limit.
+To stop backups from piling up, `install.sh` keeps only the **3 most recent backup generations** (each install is one generation, grouping that run's `statusline.sh`/`refresh-pricing.sh` backups and the saved `statusLine` value under a shared timestamp) and prunes older ones automatically. Adjust the `MAX_BACKUPS` variable near the top of `install.sh` to change the limit.
 
 ---
 
@@ -194,7 +196,7 @@ All configuration is in `statusline.sh`. Common knobs:
 ./tests/test.sh
 ```
 
-Runs 95 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard, multiple `display_name` ambiguity, the Claude Code 2.1.187+ stdin schema (`current_usage` nested under `context_window`, and `rate_limits.*.used_percentage` disambiguation so a rate-limit % never leaks into the context display), JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`, cache-write double-count regression, web-search counter propagation), recursive sub-agent collection (inline subagents plus nested `ultracode`/Workflow fleets, both folded into Σ), unknown-family models (Fable 5 with a `[1m]` context-beta id: cache_log filter, ctx/ttl freshness, Σ display name, pricing fallback), dual-cost top-line display (harness + local, fallback cases), dual-TTL display with 5m/1h token-count annotations, compact_boundary cache_log floor (pre-compact entries excluded), `/compact` cost capture (per-boundary delta accumulation, no double-counting on normal turns, no retroactive pricing of pre-feature compactions, the long-compaction lead race where the harness bumps cost before the boundary lands, and back-to-back compactions with no turn between), and an end-to-end render with Σ lines.
+Runs 101 assertions covering: harness JSON extraction (compact + pretty-printed), the `_snum` regression guard, multiple `display_name` ambiguity, install/uninstall settings safety (only the `statusLine` key is ever read or written; unrelated keys survive a full install→uninstall cycle), the Claude Code 2.1.187+ stdin schema (`current_usage` nested under `context_window`, and `rate_limits.*.used_percentage` disambiguation so a rate-limit % never leaks into the context display), JSONL aggregation (token summing, duplicate-uuid dedup, synthetic-entry filtering, `ephemeral_5m/1h` vs legacy `cache_creation_input_tokens`, cache-write double-count regression, web-search counter propagation), recursive sub-agent collection (inline subagents plus nested `ultracode`/Workflow fleets, both folded into Σ), unknown-family models (Fable 5 with a `[1m]` context-beta id: cache_log filter, ctx/ttl freshness, Σ display name, pricing fallback), dual-cost top-line display (harness + local, fallback cases), dual-TTL display with 5m/1h token-count annotations, compact_boundary cache_log floor (pre-compact entries excluded), `/compact` cost capture (per-boundary delta accumulation, no double-counting on normal turns, no retroactive pricing of pre-feature compactions, the long-compaction lead race where the harness bumps cost before the boundary lands, and back-to-back compactions with no turn between), and an end-to-end render with Σ lines.
 
 CI runs automatically on every push and pull request via GitHub Actions (no extra dependencies — `jq` is intentionally absent to verify the no-jq path).
 
