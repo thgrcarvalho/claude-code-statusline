@@ -680,6 +680,23 @@ else
   echo "  (skipped: jq not available to assert settings contents)"
 fi
 
+echo "--- Test 37: install fails early & clean when a source file (statusline.sh) is missing"
+# A plain `git pull` won't restore a working-tree file the incoming commits didn't touch, so
+# statusline.sh can be absent at install time. install.sh must error before backing up or
+# editing settings.json — not die on a cryptic mid-run `cp: No such file`. Run a copied
+# install.sh from a SCRIPT_DIR that has refresh-pricing.sh but NOT statusline.sh.
+SRC37="/tmp/sltest-missing-src-$$"; H37="/tmp/sltest-missing-home-$$"
+rm -rf "$SRC37" "$H37"; mkdir -p "$SRC37" "$H37/.claude"
+cp "$ROOT/install.sh" "$ROOT/refresh-pricing.sh" "$SRC37/"   # deliberately omit statusline.sh
+_settings37='{"model":"opus"}'
+printf '%s' "$_settings37" > "$H37/.claude/settings.json"
+out37=$(HOME="$H37" bash "$SRC37/install.sh" 2>&1; echo "exit:$?")
+assert_contains "names the missing file"          "statusline.sh is missing"       "$out37"
+assert_contains "prints the recovery command"     "git checkout -- statusline.sh"  "$out37"
+assert_contains "exits non-zero"                  "exit:1"                          "$out37"
+assert_eq       "settings.json left untouched"    "$_settings37"  "$(cat "$H37/.claude/settings.json")"
+rm -rf "$SRC37" "$H37"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
