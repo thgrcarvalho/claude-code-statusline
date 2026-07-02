@@ -323,8 +323,28 @@ if [ -f "$LAST_STATE" ]; then
   prev_ts=$(cut -d: -f2 "$LAST_STATE" 2>/dev/null)
 fi
 
+# Model-family prefix used BOTH to tag new cache_log entries (write path, below) and to
+# filter them when reading back (per-model ttl/ctx, further down). Deriving tag and filter
+# from the same stdin value makes them consistent by construction. The tag used to come
+# from the transcript's last assistant line instead — but that line lags the live session
+# (appends to multi-hundred-MB transcripts trail the stdin usage update by whole turns)
+# and predates any mid-session model switch, so entries got tagged with the PREVIOUS
+# model. The reader, filtering by the active model, then matched nothing, and the ttl
+# froze at the 5m tier showing "expired(0)" while real 1h cache writes were happening.
+# model_id may be an alias like "opusplan" rather than a real Claude model ID, so derive
+# the prefix from display_name ("Opus 4.7" → "claude-opus") when the family is known.
+case "$model" in
+  Opus*)   _cache_filter="claude-opus" ;;
+  Sonnet*) _cache_filter="claude-sonnet" ;;
+  Haiku*)  _cache_filter="claude-haiku" ;;
+  Fable*)  _cache_filter="claude-fable" ;;
+  *)       _cache_filter="${model_id%%\[*}" ;;  # unknown display name: fall back to the
+           # stdin id, stripped of a [1m]-style context-beta suffix. Tag and filter still
+           # agree; at worst the family-scoped transcript grep below finds no line.
+esac
+_cache_filter="${_cache_filter:-unknown}"
+
 if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
-  echo "${tok_out}:${now}:${_cc_now}" > "$LAST_STATE"   # col 3 = harness cost at this turn (compact baseline)
   prev_ts=$now
 
   # Per-model breakdown from JSONL files (parent + sub-agents)
@@ -333,21 +353,59 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
     project_dir=$(dirname "$transcript_path")
     subagent_dir="${project_dir}/${session_uuid}/subagents"
 
-    # Collect all files: parent JSONL + sub-agent JSONLs (recursively).
-    # Subagents nest: inline Agent-tool subagents land in subagents/agent-*.jsonl,
-    # while ultracode/Workflow fleets land in subagents/workflows/wf_*/agent-*.jsonl.
-    # A non-recursive glob misses the nested fleets, so their (often large) cost never
-    # folds into the per-model Σ. find(1) catches every depth and is portable (BSD + GNU).
-    jsonl_files=("$transcript_path")
-    if [ -d "$subagent_dir" ]; then
-      while IFS= read -r f; do
-        [ -n "$f" ] && jsonl_files+=("$f")
-      done < <(find "$subagent_dir" -type f -name 'agent-*.jsonl' 2>/dev/null)
-    fi
+    # Σ regen throttle. Every regen rescans every JSONL (parent + subagents) — hundreds of
+    # MB in long sessions — and this gate fires several times per streaming turn, so naive
+    # respawning stacks concurrent full-corpus scans. Sweep regen scratch first: each
+    # regen writes through a unique .tmp.<pid> (plus a .s scan-start marker), so scratch
+    # younger than 600s means a regen is already in flight — don't stack another. Older
+    # scratch (and any bare .tmp from an older statusline) is a leftover of a killed
+    # render — remove it. Unique names make sweeping a slow-but-live regen benign: its
+    # mv target is gone, so it just discards its result; it can never install another
+    # regen's half-written file.
+    _mb_inflight=0
+    for _t in "${MODEL_BREAKDOWN}.tmp" "${MODEL_BREAKDOWN}".tmp.*; do
+      [ -e "$_t" ] || continue
+      _tm=$(stat -c '%Y' "$_t" 2>/dev/null || stat -f '%m' "$_t" 2>/dev/null)
+      if [ -n "$_tm" ] && [ "$((now - _tm))" -lt 600 ]; then
+        _mb_inflight=1
+      else
+        rm -f "$_t" 2>/dev/null
+      fi
+    done
 
-    # Parse JSONL with awk: deduplicate by uuid, group by model, sum token counts
-    # Output format: "<model> <in> <cr> <cw5m> <cw1h> <out>" — one line per model
-    (awk '
+    # Regen only when there is new data: the parent transcript OR any subagent JSONL
+    # newer than the breakdown. Subagent fleets grow without the parent being appended —
+    # keying on the parent's mtime alone would silently leave their cost out of Σ. The
+    # finished breakdown's mtime is backdated to its scan START (the touch -r below), so
+    # lines appended while a scan was already reading still compare newer and re-arm the
+    # next regen instead of being shadowed forever.
+    _regen=0
+    if [ ! -s "$MODEL_BREAKDOWN" ] || [ "$transcript_path" -nt "$MODEL_BREAKDOWN" ]; then
+      _regen=1
+    elif [ -d "$subagent_dir" ] && \
+         [ -n "$(find "$subagent_dir" -type f -name 'agent-*.jsonl' -newer "$MODEL_BREAKDOWN" 2>/dev/null | head -1)" ]; then
+      _regen=1
+    fi
+    [ "$_mb_inflight" = 1 ] && _regen=0
+
+    if [ "$_regen" = 1 ]; then
+      # Collect all files: parent JSONL + sub-agent JSONLs (recursively).
+      # Subagents nest: inline Agent-tool subagents land in subagents/agent-*.jsonl,
+      # while ultracode/Workflow fleets land in subagents/workflows/wf_*/agent-*.jsonl.
+      # A non-recursive glob misses the nested fleets, so their (often large) cost never
+      # folds into the per-model Σ. find(1) catches every depth and is portable (BSD + GNU).
+      jsonl_files=("$transcript_path")
+      if [ -d "$subagent_dir" ]; then
+        while IFS= read -r f; do
+          [ -n "$f" ] && jsonl_files+=("$f")
+        done < <(find "$subagent_dir" -type f -name 'agent-*.jsonl' 2>/dev/null)
+      fi
+
+      # Parse JSONL with awk: deduplicate by uuid, group by model, sum token counts
+      # Output format: "<model> <in> <cr> <cw5m> <cw1h> <out>" — one line per model
+      _mb_tmp="${MODEL_BREAKDOWN}.tmp.$$"
+      ( : > "${_mb_tmp}.s"
+        awk '
 /\"role\":\"assistant\"/ && /\"usage\"/ && /\"model\":\"claude-/ {
   uuid = ""
   if (match($0, /"uuid":"[^"]*"/)) {
@@ -404,8 +462,11 @@ END {
   for (m in in_sum)
     print m, in_sum[m], cr_sum[m], cw5m_sum[m], cw1h_sum[m], out_sum[m], web_sum[m], fetch_sum[m]
 }
-' "${jsonl_files[@]}" > "${MODEL_BREAKDOWN}.tmp" 2>/dev/null && \
-      mv "${MODEL_BREAKDOWN}.tmp" "$MODEL_BREAKDOWN") &
+' "${jsonl_files[@]}" > "$_mb_tmp" 2>/dev/null \
+          && touch -r "${_mb_tmp}.s" "$_mb_tmp" 2>/dev/null \
+          && mv "$_mb_tmp" "$MODEL_BREAKDOWN" 2>/dev/null
+        rm -f "${_mb_tmp}.s" "$_mb_tmp" 2>/dev/null ) &
+    fi
   fi
   [ -x "${HOME}/.claude/refresh-pricing.sh" ] && "${HOME}/.claude/refresh-pricing.sh" &
 
@@ -417,14 +478,20 @@ END {
   turn_ctx_kb=${ctx_kb:-0}
 
   # Record this turn's 5m/1h cache writes in cache_log for alive-cache TTL tracking.
-  # Format per line: "<unix_ts> <cw5m> <cw1h> <model_id> <cached_now> <ctx_pct> <ctx_kb>". Entries older than 1h are pruned.
-  # Each model (Opus, Sonnet, etc.) has a separate cache at Anthropic; we tag entries
-  # with the model so that alive sums are filtered to the currently active model only.
-  # Tag fallback: stdin model.id may carry a [1m] context-beta suffix the transcript id
-  # lacks; strip it so every cache_log entry for the model shares one comparable tag.
-  turn_cw5m=0; turn_cw1h=0; turn_model_id="${model_id%%\[*}"; turn_model_id="${turn_model_id:-unknown}"
+  # Format per line: "<unix_ts> <cw5m> <cw1h> <model_tag> <cached_now> <ctx_pct> <ctx_kb>". Entries older than 1h are pruned.
+  # Each model (Opus, Sonnet, etc.) has a separate cache at Anthropic; entries are tagged
+  # with the family prefix ($_cache_filter, derived from the live stdin above) so the
+  # read-back filter matches them by construction. The 5m/1h split is read from the newest
+  # transcript line OF THIS FAMILY: scoping by model keeps a foreign trailing line
+  # (sidechains, compaction summaries, pre-switch turns of another model) from feeding
+  # another model's tier into this one. tail -c bounds the scan — this gate fires several
+  # times per streaming turn and transcripts reach hundreds of MB, while the line we want
+  # only ever sits at the tail. A first-ever turn of a freshly switched model may find no
+  # line yet (transcript appends lag stdin) — it records 0/0 and self-corrects next turn.
+  turn_cw5m=0; turn_cw1h=0
   if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-    _last=$(grep '"role":"assistant"' "$transcript_path" 2>/dev/null | grep '"usage"' | tail -1)
+    _last=$(tail -c 8388608 "$transcript_path" 2>/dev/null | grep '"role":"assistant"' \
+      | grep '"usage"' | grep -F "\"model\":\"${_cache_filter}" | tail -1)
     if echo "$_last" | grep -qF '"ephemeral_5m_input_tokens"' 2>/dev/null; then
       _v=$(echo "$_last" | grep -oE '"ephemeral_5m_input_tokens":[0-9]+' | head -1)
       turn_cw5m=${_v##*:}; turn_cw5m=${turn_cw5m:-0}
@@ -433,8 +500,6 @@ END {
       _v=$(echo "$_last" | grep -oE '"ephemeral_1h_input_tokens":[0-9]+' | head -1)
       turn_cw1h=${_v##*:}; turn_cw1h=${turn_cw1h:-0}
     fi
-    _m=$(echo "$_last" | grep -oE '"model":"claude-[^"]*"' | head -1 | grep -oE 'claude-[^"]+')
-    [ -n "$_m" ] && turn_model_id="$_m"
   fi
   {
     while IFS=' ' read -r _ts _5 _1 _m _c _cp _ck; do
@@ -452,25 +517,25 @@ END {
       { [ "$_cp" -le 100 ] && [ "$_ck" -le 100000 ]; } || continue
       [ "$((_ts + 3600 - now))" -gt 0 ] && echo "$_ts $_5 $_1 $_m $_c $_cp $_ck"
     done < "${STATE_DIR}/cache_log.txt" 2>/dev/null
-    echo "${now} ${turn_cw5m} ${turn_cw1h} ${turn_model_id} ${cached_now} ${turn_ctx_pct} ${turn_ctx_kb}"
+    echo "${now} ${turn_cw5m} ${turn_cw1h} ${_cache_filter} ${cached_now} ${turn_ctx_pct} ${turn_ctx_kb}"
   } > "${STATE_DIR}/cache_log.txt.tmp" 2>/dev/null && \
     mv "${STATE_DIR}/cache_log.txt.tmp" "${STATE_DIR}/cache_log.txt" 2>/dev/null
+
+  # Commit the turn marker LAST — and atomically. The marker is what closes this gate
+  # (tok_out == prev_tout on the next render), so it must land only after cache_log is
+  # committed: statusline renders can be killed mid-run (huge-session renders get culled
+  # by the harness), and a marker committed first records the turn as done while its
+  # cache_log entry is lost — the gate never refires for that turn and the ttl display
+  # freezes at expired(0). Marker-last turns a killed render into a plain retry.
+  echo "${tok_out}:${now}:${_cc_now}" > "${LAST_STATE}.tmp" 2>/dev/null && \
+    mv "${LAST_STATE}.tmp" "$LAST_STATE" 2>/dev/null   # col 3 = harness cost at this turn (compact baseline)
 fi
 
-# Find the most recent cache_log entry for the active model.
+# Find the most recent cache_log entry for the active model, filtered by $_cache_filter —
+# derived from the live stdin above the turn gate, the same value used to tag entries on
+# write, so tag and filter agree by construction (older entries with full-id tags still
+# match: the filter is a prefix of them).
 # Used for (a) per-model TTL timer base and (b) which TTL tier the last write used.
-# model_id may be an alias like "opusplan" rather than a real Claude model ID, so
-# derive the filter prefix from display_name ("Opus 4.7" → "claude-opus") instead.
-case "$model" in
-  Opus*)   _cache_filter="claude-opus" ;;
-  Sonnet*) _cache_filter="claude-sonnet" ;;
-  Haiku*)  _cache_filter="claude-haiku" ;;
-  Fable*)  _cache_filter="claude-fable" ;;
-  *)       _cache_filter="${model_id%%\[*}" ;;  # best effort for unknown display names;
-           # strip a [1m]-style context-beta suffix — the stdin id carries it but the
-           # transcript model (used to tag cache_log entries) does not, so an unstripped
-           # filter matches no (or only stale fallback-tagged) entries → frozen ttl/ctx.
-esac
 model_last_ts=0; model_last_is_1h=0; model_last_cached=0
 model_last_ctx_pct=""; model_last_ctx_kb=""
 if [ -f "${STATE_DIR}/cache_log.txt" ]; then
