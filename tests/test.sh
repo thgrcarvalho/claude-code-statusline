@@ -726,8 +726,102 @@ echo "$_POISON" > "$SDIR38b/cache_log.txt"
 _pstdin "$SID38b" | bash "$SCRIPT" >/dev/null 2>&1
 cl38=$(cat "$SDIR38b/cache_log.txt" 2>/dev/null)
 assert_not_contains "prune-path: poison line purged"       "251782361782363775" "$cl38"
-assert_contains     "prune-path: clean fresh entry written" "claude-opus-4-8 247636 23 1000" "$cl38"
+assert_contains     "prune-path: clean fresh entry written" "claude-opus 247636 23 1000" "$cl38"
 rm -rf "$SDIR38b"
+
+# ─── Per-model TTL after a mid-session model switch ──────────────────────────
+echo ""
+echo "=== ttl after mid-session model switch ==="
+
+echo "--- Test 39: cache_log tag comes from live stdin, tier from the active model's own line"
+# Long-lived sessions switched Opus→Fable mid-session showed "~ttl 4:59(0)": entries were
+# tagged with the TRANSCRIPT's last assistant model (stale — appends lag stdin by whole
+# turns, and pre-switch turns belong to the old model), so the reader filtering by the
+# active model matched nothing → 5m default tier, zero cached. The tag must come from the
+# same stdin-derived family prefix the reader filters by, and the 5m/1h split must be read
+# from the newest transcript line OF THAT FAMILY, not whatever model wrote last.
+T39="/tmp/sltest-switch-$$.jsonl"; SID39="test-switch-$$"; SDIR39="/tmp/claude_session_${SID39}"
+rm -rf "$SDIR39"
+cat > "$T39" <<'EOF'
+{"type":"assistant","message":{"model":"claude-fable-5","role":"assistant","content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":4242,"cache_read_input_tokens":100,"output_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":4242}}},"uuid":"t39-a"}
+{"type":"assistant","message":{"model":"claude-opus-4-8","role":"assistant","content":[],"usage":{"input_tokens":5,"cache_creation_input_tokens":777,"cache_read_input_tokens":50,"output_tokens":60,"cache_creation":{"ephemeral_5m_input_tokens":777,"ephemeral_1h_input_tokens":0}}},"uuid":"t39-b"}
+EOF
+_swstdin() { printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5[1m]","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":1000000,"used_percentage":23,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":225,"cache_read_input_tokens":340000,"output_tokens":%s}}}' "$SID39" "$T39" "$1"; }
+out39=$(_swstdin 416 | bash "$SCRIPT" 2>/dev/null | strip_ansi | head -1)
+cl39=$(cat "$SDIR39/cache_log.txt" 2>/dev/null)
+assert_contains     "entry tagged with active family, not transcript" " claude-fable " "$cl39"
+assert_not_contains "no opus tag despite opus trailing line"          "claude-opus"    "$cl39"
+assert_eq "cw1h from the fable line (not opus's 5m 777)" "4242" "$(printf '%s' "$cl39" | awk 'END{print $3}')"
+_ttl39=$(printf '%s' "$out39" | grep -oE '[0-9]+:[0-9]{2}:[0-9]{2}' | head -1)
+assert_eq       "1h-tier h:mm:ss countdown shown" "1" "$([ -n "$_ttl39" ] && echo 1 || echo 0)"
+assert_contains "cached amount shown, not (0)"    "(340k)" "$out39"
+assert_not_contains "the 4:59(0) failure mode is gone" "(0)" "$out39"
+# Same stdin again → marker matches → gate closed, no duplicate entry
+_swstdin 416 | bash "$SCRIPT" >/dev/null 2>&1
+assert_eq "gate closed on re-render (single entry)" "1" "$(wc -l < "$SDIR39/cache_log.txt" | tr -d ' ')"
+
+echo "--- Test 40: turn marker commits AFTER cache_log (killed render = plain retry)"
+# Giant-session renders get killed mid-run. The marker (last_api.ts) is what closes the
+# turn gate, so committing it first recorded the turn as done while its cache_log entry
+# was lost — the gate never refired and ttl froze at expired(0) (observed live: state dir
+# with last_api.ts present and cache_log.txt never created). Marker must commit last.
+_ln_cl=$(grep -nF 'cache_log.txt.tmp"' "$SCRIPT" | head -1 | cut -d: -f1)
+_ln_mk=$(grep -nF 'echo "${tok_out}:${now}:${_cc_now}"' "$SCRIPT" | head -1 | cut -d: -f1)
+assert_eq "marker write is after cache_log write in the gate" "1" \
+  "$([ -n "$_ln_cl" ] && [ -n "$_ln_mk" ] && [ "$_ln_mk" -gt "$_ln_cl" ] && echo 1 || echo 0)"
+# Functional: losing the marker (killed render) makes the gate refire and rewrite the turn
+rm -f "$SDIR39/last_api.ts"
+_swstdin 416 | bash "$SCRIPT" >/dev/null 2>&1
+assert_eq "gate refires when marker is missing (retry)" "2" "$(wc -l < "$SDIR39/cache_log.txt" | tr -d ' ')"
+assert_contains "marker rewritten on retry" "416:" "$(cat "$SDIR39/last_api.ts" 2>/dev/null)"
+rm -rf "$SDIR39" "$T39"
+
+echo "--- Test 41: Σ regen is throttled — skip when current or in flight, redo orphans"
+# Every regen rescans every JSONL (hundreds of MB in long sessions) and the gate fires
+# several times per streaming turn: naive respawning stacked concurrent full-corpus scans
+# (a plausible WSL killer) and a killed regen left a 0-byte .tmp decoy forever.
+T41="/tmp/sltest-throttle-$$.jsonl"; SID41="test-throttle-$$"; SDIR41="/tmp/claude_session_${SID41}"
+rm -rf "$SDIR41"
+printf '%s\n' '{"type":"assistant","message":{"model":"claude-fable-5","role":"assistant","content":[],"usage":{"input_tokens":9,"cache_creation_input_tokens":10,"cache_read_input_tokens":11,"output_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10}}},"uuid":"t41-a"}' > "$T41"
+_thstdin() { printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":1000000,"used_percentage":10,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":1,"cache_read_input_tokens":1,"output_tokens":%s}}}' "$SID41" "$T41" "$1"; }
+MB41="$SDIR41/model_breakdown.txt"
+# (a) stale breakdown → regen runs (background: poll briefly for the mv)
+_thstdin 100 | bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && [ ! -s "$MB41" ]; do sleep 0.1; _i=$((_i+1)); done
+assert_contains "regen produced the breakdown" "claude-fable-5" "$(cat "$MB41" 2>/dev/null)"
+# (b) breakdown newer than transcript, no subagents → regen skipped entirely
+touch -t 202001010000 "$T41"
+printf '%s\n' "SENTINEL-KEEP 1 2 3 4 5 6 7" > "$MB41"
+_thstdin 200 | bash "$SCRIPT" >/dev/null 2>&1
+sleep 0.7
+assert_contains "breakdown untouched when already current" "SENTINEL-KEEP" "$(cat "$MB41" 2>/dev/null)"
+assert_eq       "no regen scratch spawned" "0" "$(ls "$MB41".tmp* 2>/dev/null | wc -l | tr -d ' ')"
+# (c) fresh scratch (regen in flight) blocks a second spawn
+touch "$T41"; touch -t 202001010000 "$MB41"
+: > "$MB41.tmp.99999"
+_thstdin 300 | bash "$SCRIPT" >/dev/null 2>&1
+sleep 0.7
+assert_contains "in-flight scratch blocks respawn (sentinel kept)" "SENTINEL-KEEP" "$(cat "$MB41" 2>/dev/null)"
+assert_eq       "in-flight scratch left alone"                     "1" "$([ -e "$MB41.tmp.99999" ] && echo 1 || echo 0)"
+# (d) old orphaned scratch (killed regen) — both unique and legacy bare .tmp — is purged, regen redone
+touch -t 202001010000 "$MB41.tmp.99999"
+: > "$MB41.tmp"; touch -t 202001010000 "$MB41.tmp"
+_thstdin 400 | bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-fable-5' "$MB41" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+assert_contains "orphans purged, breakdown regenerated" "claude-fable-5" "$(cat "$MB41" 2>/dev/null)"
+assert_eq "unique orphan swept" "0" "$([ -e "$MB41.tmp.99999" ] && echo 1 || echo 0)"
+assert_eq "legacy bare .tmp orphan swept" "0" "$([ -e "$MB41.tmp" ] && echo 1 || echo 0)"
+# (e) subagent JSONL growth re-arms regen even when the parent transcript is untouched
+# (fleets write subagents/**/agent-*.jsonl without a parent append; their cost must fold into Σ)
+SUB41="${T41%.jsonl}/subagents"
+mkdir -p "$SUB41"
+printf '%s\n' '{"type":"assistant","message":{"model":"claude-opus-4-8","role":"assistant","content":[],"usage":{"input_tokens":7,"cache_creation_input_tokens":8,"cache_read_input_tokens":9,"output_tokens":13,"cache_creation":{"ephemeral_5m_input_tokens":8,"ephemeral_1h_input_tokens":0}}},"uuid":"t41-sub"}' > "$SUB41/agent-sub.jsonl"
+touch -t 202001010000 "$T41" "$MB41"   # parent and breakdown equally old — only the subagent is new
+_thstdin 500 | bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-opus-4-8' "$MB41" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+assert_contains "subagent growth re-armed the regen" "claude-opus-4-8" "$(cat "$MB41" 2>/dev/null)"
+assert_contains "parent still folded in alongside"   "claude-fable-5"  "$(cat "$MB41" 2>/dev/null)"
+rm -rf "$SDIR41" "$T41" "${T41%.jsonl}"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
