@@ -53,6 +53,14 @@ strip_ansi() { sed 's/\x1b\[[0-9;]*[mGKHF]//g'; }
 # ─── JSONL breakdown awk (mirrors statusline.sh exactly) ─────────────────────
 run_breakdown() {
   awk '
+function sumf(s, name,   t, f, tot) {
+  tot = 0; t = s
+  while (match(t, "\"" name "\":[0-9]+")) {
+    f = substr(t, RSTART, RLENGTH); sub(".*:", "", f); tot += f + 0
+    t = substr(t, RSTART + RLENGTH)
+  }
+  return tot
+}
 /"role":"assistant"/ && /"usage"/ && /"model":"claude-/ {
   uuid = ""
   if (match($0, /"uuid":"[^"]*"/)) {
@@ -65,27 +73,20 @@ run_breakdown() {
     f = substr($0, RSTART, RLENGTH); gsub(/"model":"/, "", f); gsub(/"$/, "", f); model = f
   }
   if (model == "") next
-  in_tok = 0
-  if (match($0, /"input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"input_tokens":/, "", f); in_tok = f+0 }
-  cr = 0
-  if (match($0, /"cache_read_input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"cache_read_input_tokens":/, "", f); cr = f+0 }
-  cw5m = 0; cw1h = 0
-  if (match($0, /"ephemeral_5m_input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"ephemeral_5m_input_tokens":/, "", f); cw5m = f+0 }
-  if (match($0, /"ephemeral_1h_input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"ephemeral_1h_input_tokens":/, "", f); cw1h = f+0 }
-  if (cw5m == 0 && cw1h == 0 && match($0, /"cache_creation_input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"cache_creation_input_tokens":/, "", f); cw1h = f+0 }
+  seg = $0
+  p = index($0, "\"iterations\":[")
+  if (p > 0) { seg = substr($0, p); q = index(seg, "]"); if (q > 0) seg = substr(seg, 1, q) }
+  in_tok = sumf(seg, "input_tokens")
+  cr = sumf(seg, "cache_read_input_tokens")
+  cw5m = sumf(seg, "ephemeral_5m_input_tokens")
+  cw1h = sumf(seg, "ephemeral_1h_input_tokens")
+  if (cw5m == 0 && cw1h == 0) cw1h = sumf(seg, "cache_creation_input_tokens")
   web = 0; fetch = 0
   if (match($0, /"web_search_requests":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"web_search_requests":/, "", f); web = f+0 }
   if (match($0, /"web_fetch_requests":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"web_fetch_requests":/, "", f); fetch = f+0 }
-  out = 0
-  if (match($0, /"output_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"output_tokens":/, "", f); out = f+0 }
+  out = sumf(seg, "output_tokens")
   fingerprint = model ":" in_tok ":" out
   if (fingerprint == prev_fingerprint) next
   prev_fingerprint = fingerprint
@@ -822,6 +823,145 @@ _i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-opus-4-8' "$MB41" 2>/dev/null; d
 assert_contains "subagent growth re-armed the regen" "claude-opus-4-8" "$(cat "$MB41" 2>/dev/null)"
 assert_contains "parent still folded in alongside"   "claude-fable-5"  "$(cat "$MB41" 2>/dev/null)"
 rm -rf "$SDIR41" "$T41" "${T41%.jsonl}"
+
+# ─── CC 2.1.2xx: NUL padding, iterations[], idle probe, tier inheritance ─────
+echo ""
+echo "=== CC 2.1.2xx regressions ==="
+
+echo "--- Test 42: NUL crash-padding can't hide transcript lines from grep"
+# Host crashes (WSL) leave zero-fill padding blocks inside transcripts. GNU grep flips
+# to binary mode at the first NUL and SUPPRESSES every later match: the ttl read
+# returned lines from BEFORE the padding (observed live: a month-stale line won a fresh
+# read), and a compact_boundary logged after a NUL block became invisible. grep -a fixes both.
+T42="/tmp/sltest-nul-$$.jsonl"; SID42="test-nul-$$"; SDIR42="/tmp/claude_session_${SID42}"
+rm -rf "$SDIR42"
+printf '%s\n' '{"type":"assistant","message":{"model":"claude-fable-5","role":"assistant","content":[],"usage":{"input_tokens":1,"cache_creation_input_tokens":1111,"cache_read_input_tokens":10,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1111}}},"uuid":"t42-a"}' > "$T42"
+head -c 512 /dev/zero >> "$T42"; printf '\n' >> "$T42"
+printf '%s\n' '{"type":"assistant","message":{"model":"claude-fable-5","role":"assistant","content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":2222,"cache_read_input_tokens":20,"output_tokens":6,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2222}}},"uuid":"t42-b"}' >> "$T42"
+printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":1000000,"used_percentage":15,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":50000,"output_tokens":42}}}' "$SID42" "$T42" \
+  | bash "$SCRIPT" >/dev/null 2>&1
+assert_eq "ttl read sees the line AFTER the NUL block (cw1h=2222)" "2222" \
+  "$(awk 'END{print $3}' "$SDIR42/cache_log.txt" 2>/dev/null)"
+rm -rf "$SDIR42" "$T42"
+# compact_boundary behind a NUL block must still be found (post-compact ctx recovery)
+T42b="/tmp/sltest-nulb-$$.jsonl"; SID42b="test-nulb-$$"; SDIR42b="/tmp/claude_session_${SID42b}"
+rm -rf "$SDIR42b"; mkdir -p "$SDIR42b"
+_now42=$(date +%s)
+_iso42=$(date -u -d "@${_now42}" +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || \
+         date -u -r "${_now42}" +"%Y-%m-%dT%H:%M:%S.000Z")
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"hi"},"uuid":"t42b-u"}' > "$T42b"
+head -c 512 /dev/zero >> "$T42b"; printf '\n' >> "$T42b"
+_boundary "$_iso42" >> "$T42b"
+echo "9:${_now42}:1.0" > "$SDIR42b/last_api.ts"   # gate closed: recovery path only
+out42b=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":200000,"used_percentage":0,"current_usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":9}}}' "$SID42b" "$T42b" \
+  | bash "$SCRIPT" 2>/dev/null | strip_ansi | head -1)
+assert_contains "boundary behind NUL still found (ctx recovered 2%)" "ctx 2%" "$out42b"
+rm -rf "$SDIR42b" "$T42b"
+
+echo "--- Test 43: iterations[] token sums (multi-pass turns undercounted before)"
+# CC ≥~2.1.212 writes usage.iterations[] on turns with internal retries/multi-pass
+# calls; the TOP-LEVEL usage fields cover only ONE iteration. First-match extraction
+# dropped the rest (observed live: a hidden 202k-token 1h cache write) — harness
+# total_cost_usd bills all iterations, so the local Σ ran systematically low.
+T43="/tmp/sltest-iter-$$.jsonl"; SID43="test-iter-$$"; SDIR43="/tmp/claude_session_${SID43}"
+rm -rf "$SDIR43"
+cat > "$T43" <<'EOF'
+{"type":"assistant","message":{"model":"claude-fable-5","role":"assistant","content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":130494,"output_tokens":60,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"iterations":[{"type":"message","input_tokens":2,"output_tokens":60,"cache_read_input_tokens":130494,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}},{"type":"message","input_tokens":2,"output_tokens":8,"cache_read_input_tokens":152709,"cache_creation_input_tokens":822,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":822}}],"speed":"standard"}},"uuid":"t43-a"}
+{"type":"assistant","message":{"model":"claude-opus-4-8","role":"assistant","content":[],"usage":{"input_tokens":10,"cache_creation_input_tokens":30,"cache_read_input_tokens":20,"output_tokens":40,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":30},"iterations":[{"type":"message","input_tokens":10,"output_tokens":40,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":30}}],"speed":"standard"}},"uuid":"t43-b"}
+EOF
+bd43=$(run_breakdown "$T43")
+assert_contains "2-iteration line summed (in=4 cr=283203 cw1h=822 out=68)" \
+  "claude-fable-5 4 283203 0 822 68 0 0" "$bd43"
+assert_contains "1-iteration line == top-level (no double count)" \
+  "claude-opus-4-8 10 20 0 30 40 0 0" "$bd43"
+# End-to-end: the script's embedded Σ awk must agree with the mirror
+printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":1000000,"used_percentage":10,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":1,"cache_read_input_tokens":1,"output_tokens":111}}}' "$SID43" "$T43" \
+  | bash "$SCRIPT" >/dev/null 2>&1
+MB43="$SDIR43/model_breakdown.txt"
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-fable-5' "$MB43" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+assert_contains "script Σ awk sums iterations too" "claude-fable-5 4 283203 0 822 68 0 0" "$(cat "$MB43" 2>/dev/null)"
+rm -rf "$SDIR43" "$T43"
+
+echo "--- Test 44: ttl tier survives top-level 0/0 with the 1h write inside iterations[]"
+# Multi-iteration lines can report cache_creation {5m:0,1h:0} at top level while a later
+# iteration wrote the 1h cache — first-match logged "0 0" and the ttl display flipped to
+# the 5m tier/expired against a live 1h cache.
+T44="/tmp/sltest-itertier-$$.jsonl"; SID44="test-itertier-$$"; SDIR44="/tmp/claude_session_${SID44}"
+rm -rf "$SDIR44"
+cat > "$T44" <<'EOF'
+{"type":"assistant","message":{"model":"claude-fable-5","role":"assistant","content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":130494,"output_tokens":60,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"iterations":[{"type":"message","input_tokens":2,"output_tokens":60,"cache_read_input_tokens":130494,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}},{"type":"message","input_tokens":2,"output_tokens":8,"cache_read_input_tokens":152709,"cache_creation_input_tokens":822,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":822}}],"speed":"standard"}},"uuid":"t44-a"}
+EOF
+out44=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":1000000,"used_percentage":14,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":822,"cache_read_input_tokens":140000,"output_tokens":68}}}' "$SID44" "$T44" \
+  | bash "$SCRIPT" 2>/dev/null | strip_ansi | head -1)
+assert_eq "cache_log cw1h from iterations (822), not top-level 0" "822" \
+  "$(awk 'END{print $3}' "$SDIR44/cache_log.txt" 2>/dev/null)"
+_ttl44=$(printf '%s' "$out44" | grep -oE '[0-9]+:[0-9]{2}:[0-9]{2}' | head -1)
+assert_eq           "1h-tier h:mm:ss countdown shown" "1" "$([ -n "$_ttl44" ] && echo 1 || echo 0)"
+assert_not_contains "not expired against a live 1h cache" "expired" "$out44"
+rm -rf "$SDIR44" "$T44"
+
+echo "--- Test 45: idle probe regenerates Σ during background fleets (no turn needed)"
+# Background Workflow fleets append subagent JSONLs and bill into the harness total for
+# many minutes without a main-loop turn; regen used to fire only inside the turn gate,
+# freezing the local Σ (observed live: \$24.71 harness vs \$0.51 local). Idle renders now
+# probe at most every 45s, keyed on mb_probe.ts mtime.
+T45="/tmp/sltest-idle-$$.jsonl"; SID45="test-idle-$$"; SDIR45="/tmp/claude_session_${SID45}"
+rm -rf "$SDIR45"; mkdir -p "$SDIR45"
+printf '%s\n' '{"type":"assistant","message":{"model":"claude-fable-5","role":"assistant","content":[],"usage":{"input_tokens":9,"cache_creation_input_tokens":10,"cache_read_input_tokens":11,"output_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10}}},"uuid":"t45-a"}' > "$T45"
+_now45=$(date +%s)
+echo "700:${_now45}:1.0" > "$SDIR45/last_api.ts"   # marker matches stdin → gate closed
+_idstdin() { printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":1000000,"used_percentage":10,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":1,"cache_read_input_tokens":1,"output_tokens":700}}}' "$SID45" "$T45"; }
+MB45="$SDIR45/model_breakdown.txt"
+# (a) no probe file → idle render probes immediately and builds the breakdown
+_idstdin | bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-fable-5' "$MB45" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+assert_contains "idle render built the breakdown (gate closed)" "claude-fable-5" "$(cat "$MB45" 2>/dev/null)"
+assert_eq       "probe marker written" "1" "$([ -e "$SDIR45/mb_probe.ts" ] && echo 1 || echo 0)"
+# (b) fresh probe → no rescan even though the breakdown is stale
+printf '%s\n' "SENTINEL-45 1 2 3 4 5 6 7" > "$MB45"
+touch -t 202001010000 "$MB45"   # transcript newer than breakdown → regen WOULD fire if probed
+_idstdin | bash "$SCRIPT" >/dev/null 2>&1
+sleep 0.7
+assert_contains "fresh probe blocks the rescan" "SENTINEL-45" "$(cat "$MB45" 2>/dev/null)"
+# (c) aged probe → rescan runs and folds in new subagent fleet data
+SUB45="${T45%.jsonl}/subagents"
+mkdir -p "$SUB45"
+printf '%s\n' '{"type":"assistant","message":{"model":"claude-opus-4-8","role":"assistant","content":[],"usage":{"input_tokens":7,"cache_creation_input_tokens":8,"cache_read_input_tokens":9,"output_tokens":13,"cache_creation":{"ephemeral_5m_input_tokens":8,"ephemeral_1h_input_tokens":0}}},"uuid":"t45-sub"}' > "$SUB45/agent-fleet.jsonl"
+touch -t 202001010000 "$SDIR45/mb_probe.ts"
+_idstdin | bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-opus-4-8' "$MB45" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+assert_contains "aged probe re-armed regen (fleet cost folded in)" "claude-opus-4-8" "$(cat "$MB45" 2>/dev/null)"
+rm -rf "$SDIR45" "$T45" "${T45%.jsonl}"
+
+echo "--- Test 46: 0/0 whiff inherits the previous tier instead of flipping to 5m"
+# The gate can fire before the new model's first line is flushed (or on a pure cache-hit
+# turn): the family grep finds nothing and a raw "0 0" entry flipped the reader to the
+# 5m countdown against a live 1h cache (observed live at session starts/model switches).
+T46="/tmp/sltest-whiff-$$.jsonl"; SID46="test-whiff-$$"; SDIR46="/tmp/claude_session_${SID46}"
+rm -rf "$SDIR46"; mkdir -p "$SDIR46"
+printf '%s\n' '{"type":"assistant","message":{"model":"claude-opus-4-8","role":"assistant","content":[],"usage":{"input_tokens":5,"cache_creation_input_tokens":777,"cache_read_input_tokens":50,"output_tokens":60,"cache_creation":{"ephemeral_5m_input_tokens":777,"ephemeral_1h_input_tokens":0}}},"uuid":"t46-x"}' > "$T46"
+_now46=$(date +%s)
+echo "$((_now46 - 60)) 0 500 claude-fable 99000 10 1000" > "$SDIR46/cache_log.txt"
+_whstdin() { printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":1000000,"used_percentage":10,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":1,"cache_read_input_tokens":99000,"output_tokens":%s}}}' "$1" "$2" "$3"; }
+out46=$(_whstdin "$SID46" "$T46" 77 | bash "$SCRIPT" 2>/dev/null | strip_ansi | head -1)
+assert_eq "whiffed entry inherited cw1h=500" "500" \
+  "$(awk 'END{print $3}' "$SDIR46/cache_log.txt" 2>/dev/null)"
+_ttl46=$(printf '%s' "$out46" | grep -oE '[0-9]+:[0-9]{2}:[0-9]{2}' | head -1)
+assert_eq "1h tier kept on whiff (h:mm:ss shown)" "1" "$([ -n "$_ttl46" ] && echo 1 || echo 0)"
+rm -rf "$SDIR46" "$T46"
+# (b) entries from BEFORE the last /compact are NOT inherited — that cache is dead
+T46b="/tmp/sltest-whiffb-$$.jsonl"; SID46b="test-whiffb-$$"; SDIR46b="/tmp/claude_session_${SID46b}"
+rm -rf "$SDIR46b"; mkdir -p "$SDIR46b"
+_now46b=$(date +%s)
+_iso46b=$(date -u -d "@$((_now46b - 30))" +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || \
+          date -u -r "$((_now46b - 30))" +"%Y-%m-%dT%H:%M:%S.000Z")
+printf '%s\n' '{"type":"assistant","message":{"model":"claude-opus-4-8","role":"assistant","content":[],"usage":{"input_tokens":5,"cache_creation_input_tokens":777,"cache_read_input_tokens":50,"output_tokens":60,"cache_creation":{"ephemeral_5m_input_tokens":777,"ephemeral_1h_input_tokens":0}}},"uuid":"t46b-x"}' > "$T46b"
+_boundary "$_iso46b" >> "$T46b"
+echo "$((_now46b - 120)) 0 500 claude-fable 99000 10 1000" > "$SDIR46b/cache_log.txt"
+_whstdin "$SID46b" "$T46b" 88 | bash "$SCRIPT" >/dev/null 2>&1
+assert_eq "pre-compact tier NOT inherited (cw1h stays 0)" "0" \
+  "$(awk 'END{print $3}' "$SDIR46b/cache_log.txt" 2>/dev/null)"
+rm -rf "$SDIR46b" "$T46b"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""

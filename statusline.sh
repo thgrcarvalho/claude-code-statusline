@@ -229,7 +229,11 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
   if [ -n "$_tstat" ] && [ "$_tstat" = "$_bkey" ]; then
     _compact_line="$_bval"
   else
-    _compact_line=$(grep '"subtype":"compact_boundary"' "$transcript_path" 2>/dev/null | tail -1)
+    # grep -a: transcripts can contain NUL crash-padding blocks (unclean-shutdown
+    # zero-fill). Plain GNU grep flips to binary mode at the first NUL and silently
+    # suppresses every match after it — a boundary logged past a padding block would
+    # be invisible and the compact floor stuck at an older compact.
+    _compact_line=$(grep -a '"subtype":"compact_boundary"' "$transcript_path" 2>/dev/null | tail -1)
     if [ -n "$_tstat" ]; then
       printf '%s\t%s\n' "$_tstat" "$_compact_line" > "${_bcache}.tmp" 2>/dev/null \
         && mv "${_bcache}.tmp" "$_bcache" 2>/dev/null
@@ -344,9 +348,13 @@ case "$model" in
 esac
 _cache_filter="${_cache_filter:-unknown}"
 
-if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
-  prev_ts=$now
-
+# Σ breakdown regen — decide-and-spawn, shared by two call sites: per-turn inside the
+# turn gate (as always) and the idle-render probe after it. Background Workflow fleets
+# (CC 2.1.2xx) append subagent JSONLs and bill into the harness total for many minutes
+# without any main-loop turn — regen gated on turns alone froze the local Σ for a
+# fleet's whole duration. Ends by touching MB_PROBE, which rate-limits the idle probe.
+MB_PROBE="${STATE_DIR}/mb_probe.ts"
+mb_regen_check() {
   # Per-model breakdown from JSONL files (parent + sub-agents)
   if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
     session_uuid=$(basename "$transcript_path" .jsonl)
@@ -406,6 +414,18 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
       _mb_tmp="${MODEL_BREAKDOWN}.tmp.$$"
       ( : > "${_mb_tmp}.s"
         awk '
+# Sum every occurrence of "<name>":<int> within s. CC 2.1.2xx usage lines can carry an
+# iterations[] array of per-API-call usage objects whose TOP-LEVEL fields cover only one
+# iteration — token fields must be summed across the segment, not first-matched, or
+# multi-iteration turns (retries/multi-pass) silently undercount.
+function sumf(s, name,   t, f, tot) {
+  tot = 0; t = s
+  while (match(t, "\"" name "\":[0-9]+")) {
+    f = substr(t, RSTART, RLENGTH); sub(".*:", "", f); tot += f + 0
+    t = substr(t, RSTART + RLENGTH)
+  }
+  return tot
+}
 /\"role\":\"assistant\"/ && /\"usage\"/ && /\"model\":\"claude-/ {
   uuid = ""
   if (match($0, /"uuid":"[^"]*"/)) {
@@ -420,31 +440,32 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
   }
   if (model == "") next
 
-  in_tok = 0
-  if (match($0, /"input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"input_tokens":/, "", f); in_tok = f+0 }
+  # Token scope: when iterations[] is present, sum within the array segment only —
+  # the top-level keys (which precede it in key order) reflect a single iteration.
+  # Without iterations, seg is the whole line and each key occurs once, so sumf
+  # equals the old first-match (behavior-preserving for pre-2.1.2xx transcripts).
+  # First "]" closes the array: elements only nest {} objects. "iterations":null
+  # does not match the bracket form and falls through to the whole line.
+  seg = $0
+  p = index($0, "\"iterations\":[")
+  if (p > 0) { seg = substr($0, p); q = index(seg, "]"); if (q > 0) seg = substr(seg, 1, q) }
 
-  cr = 0
-  if (match($0, /"cache_read_input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"cache_read_input_tokens":/, "", f); cr = f+0 }
+  in_tok = sumf(seg, "input_tokens")
+  cr = sumf(seg, "cache_read_input_tokens")
+  cw5m = sumf(seg, "ephemeral_5m_input_tokens")
+  cw1h = sumf(seg, "ephemeral_1h_input_tokens")
+  if (cw5m == 0 && cw1h == 0) cw1h = sumf(seg, "cache_creation_input_tokens")
 
-  cw5m = 0; cw1h = 0
-  if (match($0, /"ephemeral_5m_input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"ephemeral_5m_input_tokens":/, "", f); cw5m = f+0 }
-  if (match($0, /"ephemeral_1h_input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"ephemeral_1h_input_tokens":/, "", f); cw1h = f+0 }
-  if (cw5m == 0 && cw1h == 0 && match($0, /"cache_creation_input_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"cache_creation_input_tokens":/, "", f); cw1h = f+0 }
-
+  # web/fetch counts live in top-level server_tool_use, serialized BEFORE iterations,
+  # so whole-line first-match stays correct. On multi-iteration lines the top-level
+  # count may itself cover one iteration (unverified) — accepted minor undercount.
   web = 0; fetch = 0
   if (match($0, /"web_search_requests":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"web_search_requests":/, "", f); web = f+0 }
   if (match($0, /"web_fetch_requests":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"web_fetch_requests":/, "", f); fetch = f+0 }
 
-  out = 0
-  if (match($0, /"output_tokens":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"output_tokens":/, "", f); out = f+0 }
+  out = sumf(seg, "output_tokens")
 
   # Skip streaming checkpoints: Claude Code writes the same API response to the JSONL
   # multiple times (different UUIDs) as it streams. Consecutive entries sharing the same
@@ -468,6 +489,12 @@ END {
         rm -f "${_mb_tmp}.s" "$_mb_tmp" 2>/dev/null ) &
     fi
   fi
+  touch "$MB_PROBE" 2>/dev/null
+}
+
+if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
+  prev_ts=$now
+  mb_regen_check
   [ -x "${HOME}/.claude/refresh-pricing.sh" ] && "${HOME}/.claude/refresh-pricing.sh" &
 
   # Snapshot per-model display values at the time of this turn.
@@ -487,20 +514,42 @@ END {
   # another model's tier into this one. tail -c bounds the scan — this gate fires several
   # times per streaming turn and transcripts reach hundreds of MB, while the line we want
   # only ever sits at the tail. A first-ever turn of a freshly switched model may find no
-  # line yet (transcript appends lag stdin) — it records 0/0 and self-corrects next turn.
+  # line yet (transcript appends lag stdin) — it extracts 0/0, which the tier inheritance
+  # in the prune-and-append below converts to the previous entry's tier.
+  # grep -a: transcripts can contain NUL crash-padding; without it GNU grep flips to
+  # binary mode at the first NUL and suppresses every later match, so this chain silently
+  # returned lines from BEFORE the padding block — weeks-stale tier values (see the
+  # compact_boundary grep above for the same failure).
   turn_cw5m=0; turn_cw1h=0
   if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-    _last=$(tail -c 8388608 "$transcript_path" 2>/dev/null | grep '"role":"assistant"' \
-      | grep '"usage"' | grep -F "\"model\":\"${_cache_filter}" | tail -1)
-    if echo "$_last" | grep -qF '"ephemeral_5m_input_tokens"' 2>/dev/null; then
-      _v=$(echo "$_last" | grep -oE '"ephemeral_5m_input_tokens":[0-9]+' | head -1)
-      turn_cw5m=${_v##*:}; turn_cw5m=${turn_cw5m:-0}
-    fi
-    if echo "$_last" | grep -qF '"ephemeral_1h_input_tokens"' 2>/dev/null; then
-      _v=$(echo "$_last" | grep -oE '"ephemeral_1h_input_tokens":[0-9]+' | head -1)
-      turn_cw1h=${_v##*:}; turn_cw1h=${turn_cw1h:-0}
+    _last=$(tail -c 8388608 "$transcript_path" 2>/dev/null | grep -a '"role":"assistant"' \
+      | grep -a '"usage"' | grep -aF "\"model\":\"${_cache_filter}" | tail -1)
+    if [ -n "$_last" ]; then
+      # Sum the ephemeral fields across the iterations[] segment when present: the
+      # top-level copy covers only ONE iteration and can read 0/0 when a later
+      # iteration wrote the cache — which would flip the ttl display to the 5m tier
+      # against a live 1h cache. Same segment rule as the Σ awk above.
+      _v=$(printf '%s\n' "$_last" | awk '{
+        seg = $0
+        p = index($0, "\"iterations\":[")
+        if (p > 0) { seg = substr($0, p); q = index(seg, "]"); if (q > 0) seg = substr(seg, 1, q) }
+        c5 = 0; t = seg
+        while (match(t, /"ephemeral_5m_input_tokens":[0-9]+/)) {
+          f = substr(t, RSTART, RLENGTH); sub(".*:", "", f); c5 += f + 0
+          t = substr(t, RSTART + RLENGTH)
+        }
+        c1 = 0; t = seg
+        while (match(t, /"ephemeral_1h_input_tokens":[0-9]+/)) {
+          f = substr(t, RSTART, RLENGTH); sub(".*:", "", f); c1 += f + 0
+          t = substr(t, RSTART + RLENGTH)
+        }
+        print c5, c1
+      }')
+      turn_cw5m=${_v%% *}; turn_cw5m=${turn_cw5m:-0}
+      turn_cw1h=${_v##* }; turn_cw1h=${turn_cw1h:-0}
     fi
   fi
+  _inh_ts=0; _inh5=0; _inh1=0
   {
     while IFS=' ' read -r _ts _5 _1 _m _c _cp _ck; do
       # Carry forward only well-formed entries within the last hour. Dropping malformed lines
@@ -515,8 +564,26 @@ END {
       done
       [ "$_bad" = 1 ] && continue
       { [ "$_cp" -le 100 ] && [ "$_ck" -le 100000 ]; } || continue
-      [ "$((_ts + 3600 - now))" -gt 0 ] && echo "$_ts $_5 $_1 $_m $_c $_cp $_ck"
+      [ "$((_ts + 3600 - now))" -gt 0 ] || continue
+      echo "$_ts $_5 $_1 $_m $_c $_cp $_ck"
+      # Track the newest live same-family tier values for the inheritance below.
+      # Compact-floor guard: a pre-compact entry describes a cache that /compact
+      # invalidated — inheriting its 1h flag would resurrect a dead cache.
+      case "$_m" in
+        "${_cache_filter}"*)
+          if [ "$_ts" -ge "$compact_floor_ts" ] && [ "$_ts" -gt "$_inh_ts" ]; then
+            _inh_ts=$_ts; _inh5=$_5; _inh1=$_1
+          fi ;;
+      esac
     done < "${STATE_DIR}/cache_log.txt" 2>/dev/null
+    # Whiff inheritance: 0/0 extraction means either the family grep found no fresh
+    # line (flush race, first turn after a model switch) or the turn wrote nothing new
+    # (pure cache-hit turn). Either way the previous cache still exists and reads
+    # refresh its TTL server-side — keep the previous tier instead of letting the
+    # reader flip the display to the 5m default against a live 1h cache.
+    if [ "${turn_cw5m:-0}" -eq 0 ] && [ "${turn_cw1h:-0}" -eq 0 ] && [ "$_inh_ts" -gt 0 ]; then
+      turn_cw5m=$_inh5; turn_cw1h=$_inh1
+    fi
     echo "${now} ${turn_cw5m} ${turn_cw1h} ${_cache_filter} ${cached_now} ${turn_ctx_pct} ${turn_ctx_kb}"
   } > "${STATE_DIR}/cache_log.txt.tmp" 2>/dev/null && \
     mv "${STATE_DIR}/cache_log.txt.tmp" "${STATE_DIR}/cache_log.txt" 2>/dev/null
@@ -529,6 +596,20 @@ END {
   # freezes at expired(0). Marker-last turns a killed render into a plain retry.
   echo "${tok_out}:${now}:${_cc_now}" > "${LAST_STATE}.tmp" 2>/dev/null && \
     mv "${LAST_STATE}.tmp" "$LAST_STATE" 2>/dev/null   # col 3 = harness cost at this turn (compact baseline)
+fi
+
+# Idle-render Σ probe: catch background fleet growth between turns. Runs the same
+# decide-and-spawn at most every 45s, keyed on the probe file's mtime — NOT breakdown
+# age, which stops advancing during genuine quiet and would degenerate into a find(1)
+# over thousands of subagent files on every 1s render. touch BEFORE probing so a killed
+# render can't retry-storm. This path never writes LAST_STATE or cache_log, so the
+# crash-safe marker-last ordering above is unaffected.
+if [ "$tok_out" = "$prev_tout" ] && [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+  _pb_m=$(stat -c '%Y' "$MB_PROBE" 2>/dev/null || stat -f '%m' "$MB_PROBE" 2>/dev/null)
+  if [ -z "$_pb_m" ] || [ "$((now - _pb_m))" -ge 45 ]; then
+    touch "$MB_PROBE" 2>/dev/null
+    mb_regen_check
+  fi
 fi
 
 # Find the most recent cache_log entry for the active model, filtered by $_cache_filter —
@@ -621,8 +702,14 @@ else
 fi
 cache_timer_display="${_ttl_color}${_ttl_timer}($(fmt_tok $model_last_cached))${RESET}"
 
-# Top-line cost: show both harness (matches /usage, excludes subagents) and local sum
-# (includes subagents, uses LiteLLM rates). Neither is the authoritative Anthropic bill.
+# Top-line cost: harness total_cost_usd first, local transcript sum second. The harness
+# counter is per-PROCESS — it resets on CLI restart/resume and (CC 2.1.211+) on /clear —
+# and on CC 2.1.2xx it folds in background Workflow-fleet usage in near-real-time. The
+# local sum spans the whole transcript history (parent + subagents) at LiteLLM rates and
+# may lag a running fleet by up to the idle-probe interval + scan time. So harness>local
+# is normal shortly after fleet activity or on >8MB-per-turn undercount edge cases, and
+# local>harness is normal on any restarted/resumed/cleared session. Neither figure is
+# the authoritative Anthropic bill.
 local_cost_val=$(cat "$SESSION_COST" 2>/dev/null | tr -d '[:space:]')
 have_harness=0; have_local=0
 [ -n "$cost" ] && awk -v v="$cost" 'BEGIN{exit !(v+0 > 0)}' 2>/dev/null && have_harness=1
