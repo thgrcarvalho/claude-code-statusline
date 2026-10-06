@@ -115,12 +115,12 @@ model_display() {
 
   # New-gen IDs: claude-{family}-{major}[-minor][-YYYYMMDD][...]
   # e.g. claude-opus-4-7-20260416  →  Opus 4.7
-  if [[ "$id" =~ ^claude-(opus|sonnet|haiku|fable)-([0-9].*)$ ]]; then
+  if [[ "$id" =~ ^claude-(opus|sonnet|haiku|fable|mythos)-([0-9].*)$ ]]; then
     family="${BASH_REMATCH[1]}"
     ver="${BASH_REMATCH[2]}"
     ver=$(echo "$ver" | sed -E 's/-[0-9]{8}.*//')  # strip date suffix
     ver="${ver//-/.}"                                # hyphens → dots
-    case "$family" in opus) family="Opus";; sonnet) family="Sonnet";; haiku) family="Haiku";; fable) family="Fable";; esac
+    case "$family" in opus) family="Opus";; sonnet) family="Sonnet";; haiku) family="Haiku";; fable) family="Fable";; mythos) family="Mythos";; esac
     echo "$family $ver"
     return
   fi
@@ -143,7 +143,7 @@ model_display() {
 # Cache prices derived at use-time: read=0.10×, write_5m=1.25×, write_1h=2.00× of base
 # Live rates read from /tmp/claude_pricing.txt if refresh-pricing.sh has run (requires jq)
 pricing_for() {
-  local cache="/tmp/claude_pricing.txt"
+  local cache="${CLAUDE_STATUSLINE_PRICING_CACHE:-/tmp/claude_pricing.txt}"  # env: tests only
   local model_id="$1"
   local norm_id
   norm_id=$(echo "$model_id" | sed -E 's|^anthropic/||; s|\[[^]]*\]$||; s|-[0-9]{8}$||')
@@ -157,14 +157,16 @@ pricing_for() {
     fi
   fi
 
-  # Fallback: family pattern match on the original model id.
-  # Fable is hardcoded because LiteLLM does not list it yet (checked 2026-06):
-  # official rates are $10/$50 per Mtok (docs.anthropic.com/en/docs/about-claude/pricing).
+  # Fallback: family pattern match on the original model id, used when the LiteLLM cache
+  # is missing (no jq, offline) or lacks the id. LiteLLM lists claude-fable-5(-1) and
+  # claude-mythos-5(-1) at $10/$50 per Mtok since at least 2026-10 (it did not in 2026-06).
+  # An unknown family gets Sonnet rates: a deliberate middle guess, not a known price.
   case "$model_id" in
     *opus*|*Opus*)     echo "5.00 25.00" ;;
     *sonnet*|*Sonnet*) echo "3.00 15.00" ;;
     *haiku*|*Haiku*)   echo "1.00 5.00"  ;;
     *fable*|*Fable*)   echo "10.00 50.00" ;;
+    *mythos*|*Mythos*) echo "10.00 50.00" ;;
     *)                 echo "3.00 15.00" ;;
   esac
 }
@@ -344,6 +346,7 @@ case "$model" in
   Sonnet*) _cache_filter="claude-sonnet" ;;
   Haiku*)  _cache_filter="claude-haiku" ;;
   Fable*)  _cache_filter="claude-fable" ;;
+  Mythos*) _cache_filter="claude-mythos" ;;
   *)       _cache_filter="${model_id%%\[*}" ;;  # unknown display name: fall back to the
            # stdin id, stripped of a [1m]-style context-beta suffix. Tag and filter still
            # agree; at worst the family-scoped transcript grep below finds no line.

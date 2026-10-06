@@ -988,6 +988,27 @@ assert_contains "fresh (null usage): ctx 0%/1000k" "ctx 0%/1000k" "$out50f"
 assert_contains "fresh (null usage): zero tokens"  "↑0 +0r +0w ↓0" "$out50f"
 rm -rf /tmp/claude_session_test-stdin290*
 
+echo "--- Test 51: Mythos family — display name, ttl filter, fallback pricing"
+# claude-mythos-* ids rendered raw in Σ rows and priced at the $3/$15 unknown default
+# whenever the LiteLLM cache was missing. An empty cache file forces the fallback table.
+SID51="test-mythos-$$"; SDIR51="/tmp/claude_session_${SID51}"
+rm -rf "$SDIR51"; mkdir -p "$SDIR51"
+_now51=$(date +%s)
+echo "50:${_now51}" > "$SDIR51/last_api.ts"   # turn gate closed: prewritten files survive
+echo "$((_now51 - 20)) 0 6801 claude-mythos 73499 7 1000" > "$SDIR51/cache_log.txt"
+{
+  echo "claude-mythos-5-1 100000 0 0 0 20000 0 0"
+  echo "claude-fable-5-1[1m] 1000 0 0 0 1000 0 0"
+} > "$SDIR51/model_breakdown.txt"
+: > "/tmp/sltest-emptyprice-$$.txt"
+out51=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-mythos-5-1","display_name":"Mythos 5.1"},"cost":{"total_cost_usd":1.0},"context_window":{"used_percentage":3,"context_window_size":1000000,"current_usage":{"input_tokens":2,"cache_read_input_tokens":54000,"cache_creation_input_tokens":37,"output_tokens":50}}}' "$SID51" \
+  | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice-$$.txt" bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "Σ row: claude-mythos-5-1 → Mythos 5.1"   "Mythos 5.1:" "$out51"
+assert_contains "Σ row: claude-fable-5-1[1m] → Fable 5.1" "Fable 5.1:"  "$out51"
+assert_contains "mythos fallback 10/50 → \$2.00 (not \$0.60)" "\$2.00" "$out51"
+assert_contains "ttl uses the claude-mythos family entry (73k)" "(73k)" "$(echo "$out51" | head -1)"
+rm -rf "$SDIR51" "/tmp/sltest-emptyprice-$$.txt"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
