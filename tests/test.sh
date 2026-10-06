@@ -45,62 +45,20 @@ assert_eq() {
   else _fail "$desc" "$expected" "$actual"; fi
 }
 
-cleanup() { rm -rf /tmp/claude_session_test-*; }
+cleanup() { rm -rf /tmp/claude_session_test-*; rm -f "${SIGMA_AWK:-}"; }
 trap cleanup EXIT
 
 strip_ansi() { sed 's/\x1b\[[0-9;]*[mGKHF]//g'; }
 
-# ─── JSONL breakdown awk (mirrors statusline.sh exactly) ─────────────────────
-run_breakdown() {
-  awk '
-function sumf(s, name,   t, f, tot) {
-  tot = 0; t = s
-  while (match(t, "\"" name "\":[0-9]+")) {
-    f = substr(t, RSTART, RLENGTH); sub(".*:", "", f); tot += f + 0
-    t = substr(t, RSTART + RLENGTH)
-  }
-  return tot
-}
-/"role":"assistant"/ && /"usage"/ && /"model":"claude-/ {
-  uuid = ""
-  if (match($0, /"uuid":"[^"]*"/)) {
-    f = substr($0, RSTART, RLENGTH); gsub(/"uuid":"/, "", f); gsub(/"$/, "", f); uuid = f
-  }
-  if (uuid == "" || uuid in seen) next
-  seen[uuid] = 1
-  model = ""
-  if (match($0, /"model":"claude-[^"]*"/)) {
-    f = substr($0, RSTART, RLENGTH); gsub(/"model":"/, "", f); gsub(/"$/, "", f); model = f
-  }
-  if (model == "") next
-  seg = $0
-  p = index($0, "\"iterations\":[")
-  if (p > 0) { seg = substr($0, p); q = index(seg, "]"); if (q > 0) seg = substr(seg, 1, q) }
-  in_tok = sumf(seg, "input_tokens")
-  cr = sumf(seg, "cache_read_input_tokens")
-  cw5m = sumf(seg, "ephemeral_5m_input_tokens")
-  cw1h = sumf(seg, "ephemeral_1h_input_tokens")
-  if (cw5m == 0 && cw1h == 0) cw1h = sumf(seg, "cache_creation_input_tokens")
-  web = 0; fetch = 0
-  if (match($0, /"web_search_requests":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"web_search_requests":/, "", f); web = f+0 }
-  if (match($0, /"web_fetch_requests":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"web_fetch_requests":/, "", f); fetch = f+0 }
-  out = sumf(seg, "output_tokens")
-  fingerprint = model ":" in_tok ":" out
-  if (fingerprint == prev_fingerprint) next
-  prev_fingerprint = fingerprint
-  in_sum[model] += in_tok; cr_sum[model] += cr
-  cw5m_sum[model] += cw5m; cw1h_sum[model] += cw1h
-  out_sum[model] += out
-  web_sum[model] += web; fetch_sum[model] += fetch
-}
-END {
-  for (m in in_sum)
-    print m, in_sum[m], cr_sum[m], cw5m_sum[m], cw1h_sum[m], out_sum[m], web_sum[m], fetch_sum[m]
-}
-' "$@"
-}
+# ─── JSONL breakdown awk: the production program, extracted from statusline.sh ──
+# Never mirror it here: a fix applied to only one copy passed CI while production broke
+# (CC 2.1.28x "iterations":[] — the mirror and the script drifted independently).
+SIGMA_AWK="/tmp/sltest-sigma-$$.awk"
+sed -n '/^# >>> SIGMA_AWK/,/^# <<< SIGMA_AWK/p' "$SCRIPT" > "$SIGMA_AWK"
+if [ ! -s "$SIGMA_AWK" ]; then
+  echo "FATAL: SIGMA_AWK markers not found in statusline.sh" >&2; exit 1
+fi
+run_breakdown() { awk -f "$SIGMA_AWK" "$@"; }
 
 # ─── Stdin extraction tests ───────────────────────────────────────────────────
 echo "=== Stdin extraction ==="
@@ -874,7 +832,7 @@ assert_contains "2-iteration line summed (in=4 cr=283203 cw1h=822 out=68)" \
   "claude-fable-5 4 283203 0 822 68 0 0" "$bd43"
 assert_contains "1-iteration line == top-level (no double count)" \
   "claude-opus-4-8 10 20 0 30 40 0 0" "$bd43"
-# End-to-end: the script's embedded Σ awk must agree with the mirror
+# End-to-end: the full script path (background regen) must produce the same row
 printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":1000000,"used_percentage":10,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":1,"cache_read_input_tokens":1,"output_tokens":111}}}' "$SID43" "$T43" \
   | bash "$SCRIPT" >/dev/null 2>&1
 MB43="$SDIR43/model_breakdown.txt"
@@ -962,6 +920,43 @@ _whstdin "$SID46b" "$T46b" 88 | bash "$SCRIPT" >/dev/null 2>&1
 assert_eq "pre-compact tier NOT inherited (cw1h stays 0)" "0" \
   "$(awk 'END{print $3}' "$SDIR46b/cache_log.txt" 2>/dev/null)"
 rm -rf "$SDIR46b" "$T46b"
+
+# ─── CC 2.1.29x: usage.iterations is [] on every line ────────────────────────
+echo ""
+echo "=== CC 2.1.29x regressions ==="
+
+echo "--- Test 47: iterations:[] / null / absent all sum the top-level usage"
+# CC 2.1.28x+ writes "iterations":[] on every main AND sub-agent assistant line. The
+# 2.1.2xx segment rule matched the bare "iterations":[ prefix, so the token segment became
+# the literal "iterations":[] and every sum was 0 — the main model's Σ row vanished
+# (rows with sum 0 are hidden) and only pre-2.1.28x sub-agent lines survived.
+# Runs through statusline.sh itself (production awk), with the fixture's sub-agent dir.
+T47="$FIXTURES/jsonl_iterations_empty.jsonl"; SID47="test-iterempty-$$"; SDIR47="/tmp/claude_session_${SID47}"
+rm -rf "$SDIR47"
+printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":200000,"used_percentage":33,"current_usage":{"input_tokens":1,"cache_creation_input_tokens":500,"cache_read_input_tokens":66335,"output_tokens":45}}}' "$SID47" "$T47" \
+  | bash "$SCRIPT" >/dev/null 2>&1
+MB47="$SDIR47/model_breakdown.txt"
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' "$MB47" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+mb47=$(cat "$MB47" 2>/dev/null)
+assert_contains "main [] + null lines summed (opus row non-zero)" \
+  "claude-opus-5-5 6 195787 0 2518 1001 1 0" "$mb47"
+assert_contains "2.1.290 sub-agent [] line summed" \
+  "claude-sonnet-5 2 32353 1396 0 4277 0 0" "$mb47"
+assert_contains "pre-iterations sub-agent line still summed" \
+  "claude-haiku-4-5-20251001 5 2000 100 0 50 0 0" "$mb47"
+rm -rf "$SDIR47"
+
+echo "--- Test 48: ttl tier read from top level when iterations is []"
+# Same root cause in the cache_log tier awk: [] made it log "0 0" for a live 1h write,
+# so the ttl countdown fell back to the 5m tier / expired.
+T48="/tmp/sltest-iterempty-ttl-$$.jsonl"; SID48="test-iterempty-ttl-$$"; SDIR48="/tmp/claude_session_${SID48}"
+rm -rf "$SDIR48"
+head -1 "$FIXTURES/jsonl_iterations_empty.jsonl" > "$T48"
+printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":200000,"used_percentage":33,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":818,"cache_read_input_tokens":64317,"output_tokens":836}}}' "$SID48" "$T48" \
+  | bash "$SCRIPT" >/dev/null 2>&1
+assert_eq "cache_log cw1h=818 from top level when iterations is []" "818" \
+  "$(awk 'END{print $3}' "$SDIR48/cache_log.txt" 2>/dev/null)"
+rm -rf "$SDIR48" "$T48"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""

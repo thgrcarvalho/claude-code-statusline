@@ -414,6 +414,7 @@ mb_regen_check() {
       _mb_tmp="${MODEL_BREAKDOWN}.tmp.$$"
       ( : > "${_mb_tmp}.s"
         awk '
+# >>> SIGMA_AWK (tests/test.sh extracts and runs this exact program)
 # Sum every occurrence of "<name>":<int> within s. CC 2.1.2xx usage lines can carry an
 # iterations[] array of per-API-call usage objects whose TOP-LEVEL fields cover only one
 # iteration — token fields must be summed across the segment, not first-matched, or
@@ -444,10 +445,13 @@ function sumf(s, name,   t, f, tot) {
   # the top-level keys (which precede it in key order) reflect a single iteration.
   # Without iterations, seg is the whole line and each key occurs once, so sumf
   # equals the old first-match (behavior-preserving for pre-2.1.2xx transcripts).
-  # First "]" closes the array: elements only nest {} objects. "iterations":null
-  # does not match the bracket form and falls through to the whole line.
+  # First "]" closes the array: elements only nest {} objects. Only a NON-EMPTY array
+  # ("iterations":[{) scopes the segment: CC 2.1.28x+ writes "iterations":[] on every
+  # main and sub-agent line, and scoping to that literal summed every field to 0 — the
+  # Σ row of the main model vanished. [], null and an absent key all fall through to the
+  # whole line, where each top-level key occurs once.
   seg = $0
-  p = index($0, "\"iterations\":[")
+  p = index($0, "\"iterations\":[{")
   if (p > 0) { seg = substr($0, p); q = index(seg, "]"); if (q > 0) seg = substr(seg, 1, q) }
 
   in_tok = sumf(seg, "input_tokens")
@@ -483,6 +487,7 @@ END {
   for (m in in_sum)
     print m, in_sum[m], cr_sum[m], cw5m_sum[m], cw1h_sum[m], out_sum[m], web_sum[m], fetch_sum[m]
 }
+# <<< SIGMA_AWK
 ' "${jsonl_files[@]}" > "$_mb_tmp" 2>/dev/null \
           && touch -r "${_mb_tmp}.s" "$_mb_tmp" 2>/dev/null \
           && mv "$_mb_tmp" "$MODEL_BREAKDOWN" 2>/dev/null
@@ -528,10 +533,11 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
       # Sum the ephemeral fields across the iterations[] segment when present: the
       # top-level copy covers only ONE iteration and can read 0/0 when a later
       # iteration wrote the cache — which would flip the ttl display to the 5m tier
-      # against a live 1h cache. Same segment rule as the Σ awk above.
+      # against a live 1h cache. Same segment rule as the Σ awk above, including the
+      # non-empty-array match: 2.1.28x+ "iterations":[] must read the top level.
       _v=$(printf '%s\n' "$_last" | awk '{
         seg = $0
-        p = index($0, "\"iterations\":[")
+        p = index($0, "\"iterations\":[{")
         if (p > 0) { seg = substr($0, p); q = index(seg, "]"); if (q > 0) seg = substr(seg, 1, q) }
         c5 = 0; t = seg
         while (match(t, /"ephemeral_5m_input_tokens":[0-9]+/)) {
