@@ -427,7 +427,7 @@ function sumf(s, name,   t, f, tot) {
   }
   return tot
 }
-/\"role\":\"assistant\"/ && /\"usage\"/ && /\"model\":\"claude-/ {
+/"role":"assistant"/ && /"usage"/ && /"model":"claude-/ {
   uuid = ""
   if (match($0, /"uuid":"[^"]*"/)) {
     f = substr($0, RSTART, RLENGTH); gsub(/"uuid":"/, "", f); gsub(/"$/, "", f); uuid = f
@@ -469,11 +469,28 @@ function sumf(s, name,   t, f, tot) {
   if (match($0, /"web_fetch_requests":[0-9]+/))
     { f = substr($0, RSTART, RLENGTH); sub(/"web_fetch_requests":/, "", f); fetch = f+0 }
 
+  # output_tokens already includes thinking (output_tokens_details.thinking_tokens is a
+  # breakdown, not an addend — API semantics), so it is never summed separately.
   out = sumf(seg, "output_tokens")
 
-  # Skip streaming checkpoints: Claude Code writes the same API response to the JSONL
-  # multiple times (different UUIDs) as it streams. Consecutive entries sharing the same
-  # (model, input_tokens, output_tokens) fingerprint are duplicates — count only the first.
+  # One API message = one count. Claude Code writes one line per content block (thinking,
+  # text, each tool_use), all sharing message.id; streaming checkpoints repeat the same
+  # input/cache usage while output_tokens grows (2.1.290 sub-agents: 5, 5, 601). Keyed on
+  # message.id the LAST line wins — it carries the final output count. message.id is
+  # serialized before content, so the first "id":"msg_ is the right one (ids inside
+  # content are JSON-escaped and cannot match).
+  mid = ""
+  if (match($0, /"id":"msg_[^"]*"/)) {
+    mid = substr($0, RSTART + 6, RLENGTH - 7)
+    mid_model[mid] = model; mid_in[mid] = in_tok; mid_cr[mid] = cr
+    mid_cw5m[mid] = cw5m; mid_cw1h[mid] = cw1h; mid_out[mid] = out
+    mid_web[mid] = web; mid_fetch[mid] = fetch
+    next
+  }
+
+  # Lines without message.id (older transcripts, hand-written fixtures): fall back to the
+  # consecutive-fingerprint rule — the same response re-logged with an identical
+  # (model, input_tokens, output_tokens) is a checkpoint; count only the first.
   fingerprint = model ":" in_tok ":" out
   if (fingerprint == prev_fingerprint) next
   prev_fingerprint = fingerprint
@@ -484,6 +501,13 @@ function sumf(s, name,   t, f, tot) {
   web_sum[model] += web; fetch_sum[model] += fetch
 }
 END {
+  for (mid in mid_model) {
+    m = mid_model[mid]
+    in_sum[m] += mid_in[mid]; cr_sum[m] += mid_cr[mid]
+    cw5m_sum[m] += mid_cw5m[mid]; cw1h_sum[m] += mid_cw1h[mid]
+    out_sum[m] += mid_out[mid]
+    web_sum[m] += mid_web[mid]; fetch_sum[m] += mid_fetch[mid]
+  }
   for (m in in_sum)
     print m, in_sum[m], cr_sum[m], cw5m_sum[m], cw1h_sum[m], out_sum[m], web_sum[m], fetch_sum[m]
 }

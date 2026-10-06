@@ -958,6 +958,16 @@ assert_eq "cache_log cw1h=818 from top level when iterations is []" "818" \
   "$(awk 'END{print $3}' "$SDIR48/cache_log.txt" 2>/dev/null)"
 rm -rf "$SDIR48" "$T48"
 
+echo "--- Test 49: one API message = one count, keyed on message.id"
+# CC writes one JSONL line per content block, all sharing message.id. Sub-agent
+# streaming checkpoints repeat input/cache usage with GROWING output_tokens
+# (observed 2.1.290: 5, 5, 601), so the (model,in,out) fingerprint let 2-4 copies of
+# each call through and inflated input/cache sums 2-4x. Conversely two distinct calls
+# with identical small (in,out) were wrongly merged. message.id fixes both.
+bd49=$(run_breakdown "$FIXTURES/jsonl_msgid_checkpoints.jsonl")
+assert_contains "4 calls, last checkpoint wins (in=8 cr=58297 cw5m=350 out=1724)" \
+  "claude-sonnet-5 8 58297 350 0 1724 0 0" "$bd49"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
