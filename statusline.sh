@@ -29,7 +29,7 @@ iso_to_epoch() {
 # display_name); used_percentage/context_window_size are scoped to the context_window section
 # (Claude Code 2.1.187+ added a rate_limits block whose five_hour/seven_day tiers ALSO carry
 # used_percentage — a whole-buffer match would grab a rate-limit % whenever rate_limits is
-# serialized before context_window). Token keys stay whole-buffer: current_usage was top-level
+# serialized before context_window; still true on 2.1.290). Token keys stay whole-buffer: current_usage was top-level
 # pre-2.1.187 and nested under context_window after, and a buffer-wide first match by exact key
 # (the leading quote stops "input_tokens" matching "cache_*_input_tokens" or "total_input_tokens")
 # finds the right value under both layouts. Emits 11 newline-separated values in a fixed order —
@@ -100,6 +100,8 @@ session_id="${session_id:-default}"
 
 # Fresh session: harness used_percentage is stale until the first API call.
 # When all current_usage tokens are 0, no turn has completed — treat as 0.
+# CC 2.1.290 sends current_usage:null and used_percentage:null there instead (both fall
+# through to the 0 defaults above), and a resumed session sends zeros; kept for older CLIs.
 if [ "$tok_out" = "0" ] && [ "$tok_fresh" = "0" ] && [ "$tok_cr" = "0" ]; then
   ctx_pct=0
 fi

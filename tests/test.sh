@@ -968,6 +968,26 @@ bd49=$(run_breakdown "$FIXTURES/jsonl_msgid_checkpoints.jsonl")
 assert_contains "4 calls, last checkpoint wins (in=8 cr=58297 cw5m=350 out=1724)" \
   "claude-sonnet-5 8 58297 350 0 1724 0 0" "$bd49"
 
+echo "--- Test 50: real 2.1.290 stdin (pretty + compact; mid-session and fresh)"
+# Captured from the live CLI 2.1.290 (paths anonymized). New since 2.1.2xx:
+# context_window.total_input_tokens/total_output_tokens (must not shadow current_usage),
+# a prompt_cache block, and on a fresh session current_usage:null + used_percentage:null
+# instead of zeros. rate_limits follows context_window in this sample; the scoping
+# keeps rate_limits.*.used_percentage out in either order.
+for _v in pretty compact; do
+  if [ "$_v" = pretty ]; then _in=$(cat "$FIXTURES/stdin_2.1.290.json")
+  else _in=$(tr -d '\n' < "$FIXTURES/stdin_2.1.290.json" | sed 's/  */ /g'); fi
+  out50=$(printf '%s' "$_in" | bash "$SCRIPT" 2>/dev/null | strip_ansi | head -1)
+  assert_contains "$_v: model Opus 5.5"            "Opus 5.5"            "$out50"
+  assert_contains "$_v: ctx 14%/1000k"             "ctx 14%/1000k"       "$out50"
+  assert_contains "$_v: harness cost"              "\$17.99"             "$out50"
+  assert_contains "$_v: tokens from current_usage" "↑2 +135kr +929w ↓577" "$out50"
+done
+out50f=$(bash "$SCRIPT" < "$FIXTURES/stdin_2.1.290_fresh.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "fresh (null usage): ctx 0%/1000k" "ctx 0%/1000k" "$out50f"
+assert_contains "fresh (null usage): zero tokens"  "↑0 +0r +0w ↓0" "$out50f"
+rm -rf /tmp/claude_session_test-stdin290*
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
