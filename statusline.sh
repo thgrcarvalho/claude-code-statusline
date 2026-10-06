@@ -141,9 +141,12 @@ model_display() {
 
 # Pricing: base_input, output (USD per million tokens)
 # Cache prices derived at use-time: read=0.10×, write_5m=1.25×, write_1h=2.00× of base
-# Live rates read from /tmp/claude_pricing.txt if refresh-pricing.sh has run (requires jq)
+# Live rates read from /tmp/claude_pricing.txt if refresh-pricing.sh has run (requires jq).
+# One variable for every reader: the Σ render cache key stats this same file, so a test that
+# overrides the path can never reuse rows cached under the real file's mtime.
+PRICING_CACHE="${CLAUDE_STATUSLINE_PRICING_CACHE:-/tmp/claude_pricing.txt}"  # env: tests only
 pricing_for() {
-  local cache="${CLAUDE_STATUSLINE_PRICING_CACHE:-/tmp/claude_pricing.txt}"  # env: tests only
+  local cache="$PRICING_CACHE"
   local model_id="$1"
   local norm_id
   norm_id=$(echo "$model_id" | sed -E 's|^anthropic/||; s|\[[^]]*\]$||; s|-[0-9]{8}$||')
@@ -787,7 +790,7 @@ if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
   SIGMA_TXT="${STATE_DIR}/sigma_render.txt"
   SIGMA_KEY="${STATE_DIR}/sigma_render.key"
   _mb_m=$(stat -c '%Y' "$MODEL_BREAKDOWN" 2>/dev/null || stat -f '%m' "$MODEL_BREAKDOWN" 2>/dev/null)
-  _pr_m=$(stat -c '%Y' /tmp/claude_pricing.txt 2>/dev/null || stat -f '%m' /tmp/claude_pricing.txt 2>/dev/null)
+  _pr_m=$(stat -c '%Y' "$PRICING_CACHE" 2>/dev/null || stat -f '%m' "$PRICING_CACHE" 2>/dev/null)
   _sigma_key="${_mb_m:-0}:${_pr_m:-0}"
   if [ -f "$SIGMA_TXT" ] && [ "$(cat "$SIGMA_KEY" 2>/dev/null)" = "$_sigma_key" ]; then
     cat "$SIGMA_TXT"
