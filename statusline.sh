@@ -435,6 +435,22 @@ function sumf(s, name,   t, f, tot) {
   }
   return tot
 }
+function add(m, main, file, i, r, c5, c1, o, w, f) {
+  seen_model[m] = 1
+  if (main) {
+    in_sum[m] += i; cr_sum[m] += r; cw5m_sum[m] += c5; cw1h_sum[m] += c1
+    out_sum[m] += o; web_sum[m] += w; fetch_sum[m] += f
+  } else {
+    a_in[m] += i; a_cr[m] += r; a_cw5m[m] += c5; a_cw1h[m] += c1
+    a_out[m] += o; a_web[m] += w; a_fetch[m] += f
+    agent_seen[m, file] = 1
+  }
+}
+# Origin: the parent transcript is the first file argument; every other file is one
+# sub-agent (agent-*.jsonl). Sums are kept per (model, origin) so the render can show what
+# sub-agents cost apart from the main conversation; the harness total (and /usage) cannot.
+# The fingerprint fallback below compares consecutive lines, so it restarts per file.
+FNR == 1 { is_main = (FILENAME == ARGV[1]); prev_fingerprint = "" }
 /"role":"assistant"/ && /"usage"/ && /"model":"claude-/ {
   uuid = ""
   if (match($0, /"uuid":"[^"]*"/)) {
@@ -493,6 +509,7 @@ function sumf(s, name,   t, f, tot) {
     mid_model[mid] = model; mid_in[mid] = in_tok; mid_cr[mid] = cr
     mid_cw5m[mid] = cw5m; mid_cw1h[mid] = cw1h; mid_out[mid] = out
     mid_web[mid] = web; mid_fetch[mid] = fetch
+    mid_main[mid] = is_main; mid_file[mid] = FILENAME
     next
   }
 
@@ -502,22 +519,18 @@ function sumf(s, name,   t, f, tot) {
   fingerprint = model ":" in_tok ":" out
   if (fingerprint == prev_fingerprint) next
   prev_fingerprint = fingerprint
-
-  in_sum[model] += in_tok; cr_sum[model] += cr
-  cw5m_sum[model] += cw5m; cw1h_sum[model] += cw1h
-  out_sum[model] += out
-  web_sum[model] += web; fetch_sum[model] += fetch
+  add(model, is_main, FILENAME, in_tok, cr, cw5m, cw1h, out, web, fetch)
 }
 END {
-  for (mid in mid_model) {
-    m = mid_model[mid]
-    in_sum[m] += mid_in[mid]; cr_sum[m] += mid_cr[mid]
-    cw5m_sum[m] += mid_cw5m[mid]; cw1h_sum[m] += mid_cw1h[mid]
-    out_sum[m] += mid_out[mid]
-    web_sum[m] += mid_web[mid]; fetch_sum[m] += mid_fetch[mid]
-  }
-  for (m in in_sum)
-    print m, in_sum[m], cr_sum[m], cw5m_sum[m], cw1h_sum[m], out_sum[m], web_sum[m], fetch_sum[m]
+  for (mid in mid_model)
+    add(mid_model[mid], mid_main[mid], mid_file[mid], mid_in[mid], mid_cr[mid],
+        mid_cw5m[mid], mid_cw1h[mid], mid_out[mid], mid_web[mid], mid_fetch[mid])
+  for (k in agent_seen) { split(k, kp, SUBSEP); a_cnt[kp[1]]++ }
+  # Columns 2-8 main, 9-15 sub-agents, 16 distinct agent files that used the model.
+  for (m in seen_model)
+    print m, in_sum[m]+0, cr_sum[m]+0, cw5m_sum[m]+0, cw1h_sum[m]+0, out_sum[m]+0, \
+      web_sum[m]+0, fetch_sum[m]+0, a_in[m]+0, a_cr[m]+0, a_cw5m[m]+0, a_cw1h[m]+0, \
+      a_out[m]+0, a_web[m]+0, a_fetch[m]+0, a_cnt[m]+0
 }
 # <<< SIGMA_AWK
 ' "${jsonl_files[@]}" > "$_mb_tmp" 2>/dev/null \
@@ -796,26 +809,46 @@ if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
     cat "$SIGMA_TXT"
   else
     _sigma_out=""
-    while IFS=' ' read -r m_id m_in m_cr m_cw5m m_cw1h m_out m_web m_fetch; do
+    # Columns 2-8 main conversation, 9-15 sub-agents, 16 distinct agent files. An 8-column
+    # file from the previous script (kept in /tmp until the next regen) mixes both origins
+    # in 2-8: its agent fields read empty, so it renders totals with no attribution suffix.
+    while IFS=' ' read -r m_id m_in m_cr m_cw5m m_cw1h m_out m_web m_fetch \
+        a_in a_cr a_cw5m a_cw1h a_out a_web a_fetch a_cnt; do
       m_web="${m_web:-0}"; m_fetch="${m_fetch:-0}"
-      [ "$((m_in + m_cr + m_cw5m + m_cw1h + m_out))" -eq 0 ] && continue
+      _legacy=0; [ -z "$a_cnt" ] && _legacy=1
+      a_in="${a_in:-0}"; a_cr="${a_cr:-0}"; a_cw5m="${a_cw5m:-0}"; a_cw1h="${a_cw1h:-0}"
+      a_out="${a_out:-0}"; a_web="${a_web:-0}"; a_fetch="${a_fetch:-0}"; a_cnt="${a_cnt:-0}"
+      _m_tok=$((m_in + m_cr + m_cw5m + m_cw1h + m_out))
+      _a_tok=$((a_in + a_cr + a_cw5m + a_cw1h + a_out))
+      [ "$((_m_tok + _a_tok))" -eq 0 ] && continue
       m_name=$(model_display "$m_id")
       read m_pin m_pout <<< "$(pricing_for "$m_id")"
-      m_pcr=$(awk   -v b="$m_pin" 'BEGIN {printf "%.4f", b * 0.10}')
-      m_pcw5m=$(awk -v b="$m_pin" 'BEGIN {printf "%.4f", b * 1.25}')
-      m_pcw1h=$(awk -v b="$m_pin" 'BEGIN {printf "%.4f", b * 2.00}')
-      m_cw_total=$((m_cw5m + m_cw1h))
-      m_cost=$(echo "$m_in $m_pin $m_cr $m_pcr $m_cw5m $m_pcw5m $m_cw1h $m_pcw1h $m_out $m_pout $m_web $m_fetch" | awk '{
-        web_cost = ($11 + $12) * 0.010
-        printf "%.6f", ($1*$2 + $3*$4 + $5*$6 + $7*$8 + $9*$10) / 1000000 + web_cost
-      }')
+      # One awk prices both origins: cache read 0.10x, write 5m 1.25x, write 1h 2.00x of base.
+      read m_cost_main m_cost_agent <<< "$(echo "$m_pin $m_pout $m_in $m_cr $m_cw5m $m_cw1h $m_out $m_web $m_fetch $a_in $a_cr $a_cw5m $a_cw1h $a_out $a_web $a_fetch" | awk '
+        function c(i, r, w5, w1, o, ws, wf) {
+          return (i*$1 + r*$1*0.10 + w5*$1*1.25 + w1*$1*2.00 + o*$2) / 1000000 + (ws + wf) * 0.010
+        }
+        { printf "%.6f %.6f", c($3,$4,$5,$6,$7,$8,$9), c($10,$11,$12,$13,$14,$15,$16) }')"
+      m_cost=$(awk -v a="$m_cost_main" -v b="$m_cost_agent" 'BEGIN {printf "%.6f", a+b}')
       total_cost=$(awk -v a="$total_cost" -v b="$m_cost" 'BEGIN {printf "%.6f", a+b}')
+      m_web=$((m_web + a_web))
       ws_suffix=""
       [ "$m_web" -gt 0 ] 2>/dev/null && ws_suffix=" ${DIM}+${m_web}ws${RESET}"
-      _sigma_out="${_sigma_out}$(printf "${DIM}Σ ${CYAN}%s${RESET}${DIM}: ↑%s +%sr +%sw ↓%s = ${YELLOW}%s${RESET}%s" \
+      who_suffix=""
+      if [ "$_legacy" = 0 ]; then
+        if [ "$_a_tok" -eq 0 ]; then
+          who_suffix=" ${DIM}(main)${RESET}"
+        elif [ "$_m_tok" -eq 0 ]; then
+          who_suffix=" ${DIM}(agents ×${a_cnt})${RESET}"
+        else
+          who_suffix=" ${DIM}(main $(fmt_c "$m_cost_main") · agents ×${a_cnt} $(fmt_c "$m_cost_agent"))${RESET}"
+        fi
+      fi
+      _sigma_out="${_sigma_out}$(printf "${DIM}Σ ${CYAN}%s${RESET}${DIM}: ↑%s +%sr +%sw ↓%s = ${YELLOW}%s${RESET}%s%s" \
         "$m_name" \
-        "$(fmt_tok $m_in)" "$(fmt_tok $m_cr)" "$(fmt_tok $m_cw_total)" "$(fmt_tok $m_out)" \
-        "$(fmt_c $m_cost)" "$ws_suffix")"$'\n'
+        "$(fmt_tok $((m_in + a_in)))" "$(fmt_tok $((m_cr + a_cr)))" \
+        "$(fmt_tok $((m_cw5m + m_cw1h + a_cw5m + a_cw1h)))" "$(fmt_tok $((m_out + a_out)))" \
+        "$(fmt_c $m_cost)" "$ws_suffix" "$who_suffix")"$'\n'
     done < "$MODEL_BREAKDOWN"
     printf '%s' "$_sigma_out"
     printf '%s' "$_sigma_out" > "${SIGMA_TXT}.tmp" 2>/dev/null && mv "${SIGMA_TXT}.tmp" "$SIGMA_TXT" 2>/dev/null

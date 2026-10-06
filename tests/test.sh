@@ -537,10 +537,10 @@ printf '{"type":"assistant","uuid":"w33","message":{"role":"assistant","model":"
 _stdin33=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-4-8","display_name":"Opus 4.8","provider":"anthropic"},"context_window":{"used_percentage":50,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":50}}' "$SID33" "$TR33")
 _=$(echo "$_stdin33" | bash "$SCRIPT" 2>/dev/null)
 bd33=$(cat "$SDIR33/model_breakdown.txt" 2>/dev/null)
-# expected sum: in 1000+2000+4000=7000, out 100+200+400=700 (cr/cw all 0)
-assert_contains     "recursive collect sums parent+inline+nested" "claude-opus-4-8 7000 0 0 0 700 0 0" "$bd33"
+# expected: main in 1000/out 100; agents (inline + nested) in 2000+4000=6000, out 600, ×2
+assert_contains     "recursive collect sums parent+inline+nested" "claude-opus-4-8 1000 0 0 0 100 0 0 6000 0 0 0 600 0 0 2" "$bd33"
 # guard: the old non-recursive result (nested fleet dropped) must NOT be what we get
-assert_not_contains "non-recursive sum (nested dropped) gone"      "claude-opus-4-8 3000 0 0 0 300 0 0" "$bd33"
+assert_not_contains "non-recursive sum (nested dropped) gone"      "claude-opus-4-8 1000 0 0 0 100 0 0 2000 0 0 0 200 0 0 1" "$bd33"
 rm -rf "$SDIR33" "$TDIR33"
 
 # ─── Unknown-family model (Fable) ────────────────────────────────────────────
@@ -940,10 +940,10 @@ _i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' "$MB47" 2>/dev/null; do sleep 
 mb47=$(cat "$MB47" 2>/dev/null)
 assert_contains "main [] + null lines summed (opus row non-zero)" \
   "claude-opus-5-5 6 195787 0 2518 1001 1 0" "$mb47"
-assert_contains "2.1.290 sub-agent [] line summed" \
-  "claude-sonnet-5 2 32353 1396 0 4277 0 0" "$mb47"
-assert_contains "pre-iterations sub-agent line still summed" \
-  "claude-haiku-4-5-20251001 5 2000 100 0 50 0 0" "$mb47"
+assert_contains "2.1.290 sub-agent [] line summed (agent columns)" \
+  "claude-sonnet-5 0 0 0 0 0 0 0 2 32353 1396 0 4277 0 0 1" "$mb47"
+assert_contains "pre-iterations sub-agent line still summed (agent columns)" \
+  "claude-haiku-4-5-20251001 0 0 0 0 0 0 0 5 2000 100 0 50 0 0 1" "$mb47"
 rm -rf "$SDIR47"
 
 echo "--- Test 48: ttl tier read from top level when iterations is []"
@@ -1008,6 +1008,40 @@ assert_contains "Σ row: claude-fable-5-1[1m] → Fable 5.1" "Fable 5.1:"  "$out
 assert_contains "mythos fallback 10/50 → \$2.00 (not \$0.60)" "\$2.00" "$out51"
 assert_contains "ttl uses the claude-mythos family entry (73k)" "(73k)" "$(echo "$out51" | head -1)"
 rm -rf "$SDIR51" "/tmp/sltest-emptyprice-$$.txt"
+
+echo "--- Test 52: Σ rows split main vs sub-agent spend per model"
+# /usage (the harness ledger) lumps main and sub-agent spend together; the point of the Σ
+# rows is to see what sub-agents cost. Main file = first awk argument; each agent-*.jsonl
+# is one agent. Fable only in main, Sonnet only in 2 agents, Opus in main + 1 fleet agent.
+TA="$FIXTURES/jsonl_attrib.jsonl"; TAD="$FIXTURES/jsonl_attrib/subagents"
+bd52=$(run_breakdown "$TA" "$TAD/agent-t53d1.jsonl" "$TAD/agent-t53d2.jsonl" "$TAD/workflows/wf_t53/agent-t53d3.jsonl")
+assert_contains "main-only model: agent columns zero" \
+  "claude-fable-5-1 15000 3000000 0 100000 80000 1 0 0 0 0 0 0 0 0 0" "$bd52"
+assert_contains "agent-only model: main zero, 2 distinct agents" \
+  "claude-sonnet-5 0 0 0 0 0 0 0 11000 1100000 100000 0 11000 0 0 2" "$bd52"
+assert_contains "model in both: split columns, 1 agent" \
+  "claude-opus-5-5 20000 3000000 0 300000 60000 0 0 2000 200000 20000 0 3000 0 0 1" "$bd52"
+SID52="test-attrib-$$"; SDIR52="/tmp/claude_session_${SID52}"; rm -rf "$SDIR52"
+: > "/tmp/sltest-emptyprice52-$$.txt"
+_st52=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5-1","display_name":"Fable 5.1"},"cost":{"total_cost_usd":17.0},"context_window":{"context_window_size":1000000,"used_percentage":1,"current_usage":{"input_tokens":5000,"cache_creation_input_tokens":0,"cache_read_input_tokens":2000000,"output_tokens":30000}}}' "$SID52" "$TA")
+printf '%s' "$_st52" | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice52-$$.txt" bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' "$SDIR52/model_breakdown.txt" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+out52=$(printf '%s' "$_st52" | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice52-$$.txt" bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "main-only suffix (after +Nws)" "Fable 5.1: ↑15k +3.0Mr +100kw ↓80k = \$9.16 +1ws (main)" "$out52"
+assert_contains "agent-only suffix with count" "Sonnet 5: ↑11k +1.1Mr +100kw ↓11k = \$0.903 (agents ×2)" "$out52"
+assert_contains "both: total, then main \$X · agents ×N \$Y" \
+  "Opus 5.5: ↑22k +3.2Mr +320kw ↓63k = \$6.41 (main \$6.10 · agents ×1 \$0.310)" "$out52"
+assert_eq "local total = all models, main + agents (16.473)" "16.473000" "$(cat "$SDIR52/session_cost.txt" 2>/dev/null)"
+rm -rf "$SDIR52"
+# Legacy 8-column breakdown (written by the previous script, survives in /tmp until the
+# next regen): its columns mix main and agents, so the row renders with no suffix.
+mkdir -p "$SDIR52"; echo "50:$(date +%s)" > "$SDIR52/last_api.ts"
+echo "claude-fable-5-1 15000 3000000 0 100000 80000 1 0" > "$SDIR52/model_breakdown.txt"
+out52b=$(printf '%s' "$_st52" | sed 's/"output_tokens":30000/"output_tokens":50/' \
+  | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice52-$$.txt" bash "$SCRIPT" 2>&1 | strip_ansi)
+assert_contains     "legacy 8-col row still priced" "Fable 5.1: ↑15k +3.0Mr +100kw ↓80k = \$9.16 +1ws" "$out52b"
+assert_not_contains "legacy row: no attribution suffix" "(main" "$out52b"
+rm -rf "$SDIR52" "/tmp/sltest-emptyprice52-$$.txt"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
