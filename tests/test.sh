@@ -1085,6 +1085,15 @@ assert_eq "no cache: fallback table has Opus 5.5 4/20 + 0.20 reads; Fable 5.1 0.
   "$(_run54 "" "$ROW54" "claude-fable-5-1 0 1000000 0 0 0 0 0 0 0 0 0 0 0 0 0")"
 rm -rf "$SDIR54" "$P54"
 
+echo "--- Test 55: only web searches carry a per-request fee, not web fetches"
+# Anthropic bills web search at $10/1k requests; web fetch bills its tokens only. The
+# render charged (searches + fetches) x $0.01. 1M Sonnet 5 input ($2) + 2 searches + 3 fetches.
+assert_eq "2 searches billed, 3 fetches not (2.020000)" "2.020000" \
+  "$(_run54 "" "claude-sonnet-5 1000000 0 0 0 0 2 3 0 0 0 0 0 0 0 0")"
+assert_eq "agent-side fetches not billed either (2.000000)" "2.000000" \
+  "$(_run54 "" "claude-sonnet-5 0 0 0 0 0 0 0 1000000 0 0 0 0 0 4 1")"
+rm -rf "$SDIR54" "$P54"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="

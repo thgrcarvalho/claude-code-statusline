@@ -847,8 +847,10 @@ if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
       read m_pin m_pout m_pcr m_pcw5 m_pcw1 <<< "$(pricing_for "$m_id")"
       # One awk prices both origins with the five per-model rates (USD per Mtok).
       read m_cost_main m_cost_agent <<< "$(echo "$m_pin $m_pout $m_pcr $m_pcw5 $m_pcw1 $m_in $m_cr $m_cw5m $m_cw1h $m_out $m_web $m_fetch $a_in $a_cr $a_cw5m $a_cw1h $a_out $a_web $a_fetch" | awk '
+        # Web search: $10 per 1k requests. Web fetch has no per-request fee (its content is
+        # billed as input tokens), so wf is carried in the breakdown but never priced.
         function c(i, r, w5, w1, o, ws, wf) {
-          return (i*$1 + r*$3 + w5*$4 + w1*$5 + o*$2) / 1000000 + (ws + wf) * 0.010
+          return (i*$1 + r*$3 + w5*$4 + w1*$5 + o*$2) / 1000000 + ws * 0.010
         }
         { printf "%.6f %.6f", c($6,$7,$8,$9,$10,$11,$12), c($13,$14,$15,$16,$17,$18,$19) }')"
       m_cost=$(awk -v a="$m_cost_main" -v b="$m_cost_agent" 'BEGIN {printf "%.6f", a+b}')
