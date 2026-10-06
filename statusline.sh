@@ -147,9 +147,12 @@ model_display() {
   echo "$id"
 }
 
-# Pricing: base_input, output (USD per million tokens)
-# Cache prices derived at use-time: read=0.10×, write_5m=1.25×, write_1h=2.00× of base
+# Pricing: base_input output cache_read cache_write_5m cache_write_1h (USD per million tokens).
 # Live rates read from /tmp/claude_pricing.txt if refresh-pricing.sh has run (requires jq).
+# Cache rates are per model, not fixed multiples: Opus 5.5 reads cost 0.05x of base and
+# Fable 5.1 / Mythos 5.1 reads 0.025x, while older models keep read=0.10x, write_5m=1.25x,
+# write_1h=2.00x. A cache line without columns 4-6 (written by an older refresh-pricing.sh)
+# or a fallback row without them gets those classic multipliers.
 # One variable for every reader: the Σ render cache key stats this same file, so a test that
 # overrides the path can never reuse rows cached under the real file's mtime.
 PRICING_CACHE="${CLAUDE_STATUSLINE_PRICING_CACHE:-/tmp/claude_pricing.txt}"  # env: tests only
@@ -159,20 +162,29 @@ pricing_for() {
   local norm_id
   norm_id=$(echo "$model_id" | sed -E 's|^anthropic/||; s|\[[^]]*\]$||; s|-[0-9]{8}$||')
 
+  local rates=""
   if [ -f "$cache" ]; then
-    local rates
-    rates=$(grep -m1 "^${norm_id} " "$cache" | awk '{print $2, $3}')
-    if [ -n "$rates" ]; then
-      echo "$rates"
-      return
-    fi
+    rates=$(grep -m1 "^${norm_id} " "$cache" | awk '{ if (NF >= 6) print $2, $3, $4, $5, $6; else print $2, $3 }')
   fi
+  [ -z "$rates" ] && rates=$(_pricing_fallback "$model_id")
+  echo "$rates" | awk '{ if (NF >= 5) print $1, $2, $3, $4, $5
+                         else print $1, $2, $1 * 0.10, $1 * 1.25, $1 * 2.00 }'
+}
+
+_pricing_fallback() {
+  local model_id="$1"
 
   # Fallback: family pattern match on the original model id, used when the LiteLLM cache
   # is missing (no jq, offline) or lacks the id. LiteLLM lists claude-fable-5(-1) and
   # claude-mythos-5(-1) at $10/$50 per Mtok since at least 2026-10 (it did not in 2026-06).
   # An unknown family gets Sonnet rates: a deliberate middle guess, not a known price.
+  # Per-model rows first (case takes the first match). Opus 5.5, Sonnet 5.x and the x.1
+  # cache-read rates: LiteLLM 2026-10, confirmed to the micro-dollar against the CC 2.1.290
+  # harness total for Opus 5.5 ($0.20/M reads) and Sonnet 5 (classic multipliers).
   case "$model_id" in
+    *opus-5-5*)                echo "4.00 20.00 0.20 5.00 8.00" ;;
+    *sonnet-5*)                echo "2.00 10.00" ;;
+    *fable-5-1*|*mythos-5-1*)  echo "10.00 50.00 0.25 12.50 20.00" ;;
     *opus*|*Opus*)     echo "5.00 25.00" ;;
     *sonnet*|*Sonnet*) echo "3.00 15.00" ;;
     *haiku*|*Haiku*)   echo "1.00 5.00"  ;;
@@ -832,13 +844,13 @@ if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
       _a_tok=$((a_in + a_cr + a_cw5m + a_cw1h + a_out))
       [ "$((_m_tok + _a_tok))" -eq 0 ] && continue
       m_name=$(model_display "$m_id")
-      read m_pin m_pout <<< "$(pricing_for "$m_id")"
-      # One awk prices both origins: cache read 0.10x, write 5m 1.25x, write 1h 2.00x of base.
-      read m_cost_main m_cost_agent <<< "$(echo "$m_pin $m_pout $m_in $m_cr $m_cw5m $m_cw1h $m_out $m_web $m_fetch $a_in $a_cr $a_cw5m $a_cw1h $a_out $a_web $a_fetch" | awk '
+      read m_pin m_pout m_pcr m_pcw5 m_pcw1 <<< "$(pricing_for "$m_id")"
+      # One awk prices both origins with the five per-model rates (USD per Mtok).
+      read m_cost_main m_cost_agent <<< "$(echo "$m_pin $m_pout $m_pcr $m_pcw5 $m_pcw1 $m_in $m_cr $m_cw5m $m_cw1h $m_out $m_web $m_fetch $a_in $a_cr $a_cw5m $a_cw1h $a_out $a_web $a_fetch" | awk '
         function c(i, r, w5, w1, o, ws, wf) {
-          return (i*$1 + r*$1*0.10 + w5*$1*1.25 + w1*$1*2.00 + o*$2) / 1000000 + (ws + wf) * 0.010
+          return (i*$1 + r*$3 + w5*$4 + w1*$5 + o*$2) / 1000000 + (ws + wf) * 0.010
         }
-        { printf "%.6f %.6f", c($3,$4,$5,$6,$7,$8,$9), c($10,$11,$12,$13,$14,$15,$16) }')"
+        { printf "%.6f %.6f", c($6,$7,$8,$9,$10,$11,$12), c($13,$14,$15,$16,$17,$18,$19) }')"
       m_cost=$(awk -v a="$m_cost_main" -v b="$m_cost_agent" 'BEGIN {printf "%.6f", a+b}')
       total_cost=$(awk -v a="$total_cost" -v b="$m_cost" 'BEGIN {printf "%.6f", a+b}')
       m_web=$((m_web + a_web))

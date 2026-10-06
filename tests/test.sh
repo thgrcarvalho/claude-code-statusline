@@ -1013,6 +1013,8 @@ echo "--- Test 52: Σ rows split main vs sub-agent spend per model"
 # /usage (the harness ledger) lumps main and sub-agent spend together; the point of the Σ
 # rows is to see what sub-agents cost. Main file = first awk argument; each agent-*.jsonl
 # is one agent. Fable only in main, Sonnet only in 2 agents, Opus in main + 1 fleet agent.
+# Costs use the fallback table (empty pricing cache): Fable 5.1 10/50 with $0.25 reads,
+# Sonnet 5 2/10, Opus 5.5 4/20 with $0.20 reads.
 TA="$FIXTURES/jsonl_attrib.jsonl"; TAD="$FIXTURES/jsonl_attrib/subagents"
 bd52=$(run_breakdown "$TA" "$TAD/agent-t53d1.jsonl" "$TAD/agent-t53d2.jsonl" "$TAD/workflows/wf_t53/agent-t53d3.jsonl")
 assert_contains "main-only model: agent columns zero" \
@@ -1027,11 +1029,11 @@ _st52=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-
 printf '%s' "$_st52" | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice52-$$.txt" bash "$SCRIPT" >/dev/null 2>&1
 _i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' "$SDIR52/model_breakdown.txt" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
 out52=$(printf '%s' "$_st52" | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice52-$$.txt" bash "$SCRIPT" 2>/dev/null | strip_ansi)
-assert_contains "main-only suffix (after +Nws)" "Fable 5.1: ↑15k +3.0Mr +100kw ↓80k = \$9.16 +1ws (main)" "$out52"
-assert_contains "agent-only suffix with count" "Sonnet 5: ↑11k +1.1Mr +100kw ↓11k = \$0.903 (agents ×2)" "$out52"
+assert_contains "main-only suffix (after +Nws)" "Fable 5.1: ↑15k +3.0Mr +100kw ↓80k = \$6.91 +1ws (main)" "$out52"
+assert_contains "agent-only suffix with count" "Sonnet 5: ↑11k +1.1Mr +100kw ↓11k = \$0.602 (agents ×2)" "$out52"
 assert_contains "both: total, then main \$X · agents ×N \$Y" \
-  "Opus 5.5: ↑22k +3.2Mr +320kw ↓63k = \$6.41 (main \$6.10 · agents ×1 \$0.310)" "$out52"
-assert_eq "local total = all models, main + agents (16.473)" "16.473000" "$(cat "$SDIR52/session_cost.txt" 2>/dev/null)"
+  "Opus 5.5: ↑22k +3.2Mr +320kw ↓63k = \$4.49 (main \$4.28 · agents ×1 \$0.208)" "$out52"
+assert_eq "local total = all models, main + agents (12.000)" "12.000000" "$(cat "$SDIR52/session_cost.txt" 2>/dev/null)"
 rm -rf "$SDIR52"
 # Legacy 8-column breakdown (written by the previous script, survives in /tmp until the
 # next regen): its columns mix main and agents, so the row renders with no suffix.
@@ -1039,7 +1041,7 @@ mkdir -p "$SDIR52"; echo "50:$(date +%s)" > "$SDIR52/last_api.ts"
 echo "claude-fable-5-1 15000 3000000 0 100000 80000 1 0" > "$SDIR52/model_breakdown.txt"
 out52b=$(printf '%s' "$_st52" | sed 's/"output_tokens":30000/"output_tokens":50/' \
   | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice52-$$.txt" bash "$SCRIPT" 2>&1 | strip_ansi)
-assert_contains     "legacy 8-col row still priced" "Fable 5.1: ↑15k +3.0Mr +100kw ↓80k = \$9.16 +1ws" "$out52b"
+assert_contains     "legacy 8-col row still priced" "Fable 5.1: ↑15k +3.0Mr +100kw ↓80k = \$6.91 +1ws" "$out52b"
 assert_not_contains "legacy row: no attribution suffix" "(main" "$out52b"
 rm -rf "$SDIR52" "/tmp/sltest-emptyprice52-$$.txt"
 
@@ -1059,6 +1061,29 @@ assert_contains "no effort key: no parentheses" "Opus 4.7 │ ctx" "$out53"
 out53=$(bash "$SCRIPT" < "$FIXTURES/stdin-multi-display-name.json" 2>/dev/null | strip_ansi | head -1)
 assert_contains "numeric/legacy effort: no parentheses" "Opus 4.7 │ ctx" "$out53"
 rm -rf /tmp/claude_session_test-stdin290* /tmp/claude_session_test-multi-dn
+
+echo "--- Test 54: per-model cache rates — Opus 5.5 / Fable 5.1 cache reads are not 0.10x"
+# A fixed 0.10x cache-read multiplier overpriced the newest models: LiteLLM (and the harness,
+# matched to the micro-dollar on CC 2.1.290) bill Opus 5.5 reads at $0.20/M (0.05x of $4)
+# and Fable 5.1 / Mythos 5.1 reads at $0.25/M (0.025x of $10). Real Opus 5.5 call from
+# 2026-10-06: in 2, cache read 237146, 1h write 1523, out 830 → harness +$0.076221.
+SID54="test-cacherate-$$"; SDIR54="/tmp/claude_session_${SID54}"; P54="/tmp/sltest-price54-$$.txt"
+_run54() {   # $1 = pricing cache content ("" = empty file → fallback table)
+  rm -rf "$SDIR54"; mkdir -p "$SDIR54"; echo "50:$(date +%s)" > "$SDIR54/last_api.ts"
+  printf '%s\n' "${@:2}" > "$SDIR54/model_breakdown.txt"
+  printf '%s' "$1" > "$P54"
+  printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":200000,"used_percentage":1,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":1,"output_tokens":50}}}' "$SID54" \
+    | CLAUDE_STATUSLINE_PRICING_CACHE="$P54" bash "$SCRIPT" >/dev/null 2>&1
+  cat "$SDIR54/session_cost.txt" 2>/dev/null
+}
+ROW54="claude-opus-5-5 2 237146 0 1523 830 0 0 0 0 0 0 0 0 0 0"
+assert_eq "6-col cache: Opus 5.5 call = harness \$0.076221" "0.076221" \
+  "$(_run54 "claude-opus-5-5 4 20 0.2 5 8" "$ROW54")"
+assert_eq "3-col (old) cache: multipliers still apply (0.123650)" "0.123650" \
+  "$(_run54 "claude-opus-5-5 4 20" "$ROW54")"
+assert_eq "no cache: fallback table has Opus 5.5 4/20 + 0.20 reads; Fable 5.1 0.25 reads" "0.326221" \
+  "$(_run54 "" "$ROW54" "claude-fable-5-1 0 1000000 0 0 0 0 0 0 0 0 0 0 0 0 0")"
+rm -rf "$SDIR54" "$P54"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
