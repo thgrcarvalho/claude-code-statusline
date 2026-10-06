@@ -45,62 +45,20 @@ assert_eq() {
   else _fail "$desc" "$expected" "$actual"; fi
 }
 
-cleanup() { rm -rf /tmp/claude_session_test-*; }
+cleanup() { rm -rf /tmp/claude_session_test-*; rm -f "${SIGMA_AWK:-}"; }
 trap cleanup EXIT
 
 strip_ansi() { sed 's/\x1b\[[0-9;]*[mGKHF]//g'; }
 
-# ─── JSONL breakdown awk (mirrors statusline.sh exactly) ─────────────────────
-run_breakdown() {
-  awk '
-function sumf(s, name,   t, f, tot) {
-  tot = 0; t = s
-  while (match(t, "\"" name "\":[0-9]+")) {
-    f = substr(t, RSTART, RLENGTH); sub(".*:", "", f); tot += f + 0
-    t = substr(t, RSTART + RLENGTH)
-  }
-  return tot
-}
-/"role":"assistant"/ && /"usage"/ && /"model":"claude-/ {
-  uuid = ""
-  if (match($0, /"uuid":"[^"]*"/)) {
-    f = substr($0, RSTART, RLENGTH); gsub(/"uuid":"/, "", f); gsub(/"$/, "", f); uuid = f
-  }
-  if (uuid == "" || uuid in seen) next
-  seen[uuid] = 1
-  model = ""
-  if (match($0, /"model":"claude-[^"]*"/)) {
-    f = substr($0, RSTART, RLENGTH); gsub(/"model":"/, "", f); gsub(/"$/, "", f); model = f
-  }
-  if (model == "") next
-  seg = $0
-  p = index($0, "\"iterations\":[")
-  if (p > 0) { seg = substr($0, p); q = index(seg, "]"); if (q > 0) seg = substr(seg, 1, q) }
-  in_tok = sumf(seg, "input_tokens")
-  cr = sumf(seg, "cache_read_input_tokens")
-  cw5m = sumf(seg, "ephemeral_5m_input_tokens")
-  cw1h = sumf(seg, "ephemeral_1h_input_tokens")
-  if (cw5m == 0 && cw1h == 0) cw1h = sumf(seg, "cache_creation_input_tokens")
-  web = 0; fetch = 0
-  if (match($0, /"web_search_requests":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"web_search_requests":/, "", f); web = f+0 }
-  if (match($0, /"web_fetch_requests":[0-9]+/))
-    { f = substr($0, RSTART, RLENGTH); sub(/"web_fetch_requests":/, "", f); fetch = f+0 }
-  out = sumf(seg, "output_tokens")
-  fingerprint = model ":" in_tok ":" out
-  if (fingerprint == prev_fingerprint) next
-  prev_fingerprint = fingerprint
-  in_sum[model] += in_tok; cr_sum[model] += cr
-  cw5m_sum[model] += cw5m; cw1h_sum[model] += cw1h
-  out_sum[model] += out
-  web_sum[model] += web; fetch_sum[model] += fetch
-}
-END {
-  for (m in in_sum)
-    print m, in_sum[m], cr_sum[m], cw5m_sum[m], cw1h_sum[m], out_sum[m], web_sum[m], fetch_sum[m]
-}
-' "$@"
-}
+# ─── JSONL breakdown awk: the production program, extracted from statusline.sh ──
+# Never mirror it here: a fix applied to only one copy passed CI while production broke
+# (CC 2.1.28x "iterations":[] — the mirror and the script drifted independently).
+SIGMA_AWK="/tmp/sltest-sigma-$$.awk"
+sed -n '/^# >>> SIGMA_AWK/,/^# <<< SIGMA_AWK/p' "$SCRIPT" > "$SIGMA_AWK"
+if [ ! -s "$SIGMA_AWK" ]; then
+  echo "FATAL: SIGMA_AWK markers not found in statusline.sh" >&2; exit 1
+fi
+run_breakdown() { awk -f "$SIGMA_AWK" "$@"; }
 
 # ─── Stdin extraction tests ───────────────────────────────────────────────────
 echo "=== Stdin extraction ==="
@@ -579,10 +537,10 @@ printf '{"type":"assistant","uuid":"w33","message":{"role":"assistant","model":"
 _stdin33=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-4-8","display_name":"Opus 4.8","provider":"anthropic"},"context_window":{"used_percentage":50,"context_window_size":1000000},"current_usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":50}}' "$SID33" "$TR33")
 _=$(echo "$_stdin33" | bash "$SCRIPT" 2>/dev/null)
 bd33=$(cat "$SDIR33/model_breakdown.txt" 2>/dev/null)
-# expected sum: in 1000+2000+4000=7000, out 100+200+400=700 (cr/cw all 0)
-assert_contains     "recursive collect sums parent+inline+nested" "claude-opus-4-8 7000 0 0 0 700 0 0" "$bd33"
+# expected: main in 1000/out 100; agents (inline + nested) in 2000+4000=6000, out 600, ×2
+assert_contains     "recursive collect sums parent+inline+nested" "claude-opus-4-8 1000 0 0 0 100 0 0 6000 0 0 0 600 0 0 2" "$bd33"
 # guard: the old non-recursive result (nested fleet dropped) must NOT be what we get
-assert_not_contains "non-recursive sum (nested dropped) gone"      "claude-opus-4-8 3000 0 0 0 300 0 0" "$bd33"
+assert_not_contains "non-recursive sum (nested dropped) gone"      "claude-opus-4-8 1000 0 0 0 100 0 0 2000 0 0 0 200 0 0 1" "$bd33"
 rm -rf "$SDIR33" "$TDIR33"
 
 # ─── Unknown-family model (Fable) ────────────────────────────────────────────
@@ -874,7 +832,7 @@ assert_contains "2-iteration line summed (in=4 cr=283203 cw1h=822 out=68)" \
   "claude-fable-5 4 283203 0 822 68 0 0" "$bd43"
 assert_contains "1-iteration line == top-level (no double count)" \
   "claude-opus-4-8 10 20 0 30 40 0 0" "$bd43"
-# End-to-end: the script's embedded Σ awk must agree with the mirror
+# End-to-end: the full script path (background regen) must produce the same row
 printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5","display_name":"Fable 5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":1000000,"used_percentage":10,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":1,"cache_read_input_tokens":1,"output_tokens":111}}}' "$SID43" "$T43" \
   | bash "$SCRIPT" >/dev/null 2>&1
 MB43="$SDIR43/model_breakdown.txt"
@@ -962,6 +920,193 @@ _whstdin "$SID46b" "$T46b" 88 | bash "$SCRIPT" >/dev/null 2>&1
 assert_eq "pre-compact tier NOT inherited (cw1h stays 0)" "0" \
   "$(awk 'END{print $3}' "$SDIR46b/cache_log.txt" 2>/dev/null)"
 rm -rf "$SDIR46b" "$T46b"
+
+# ─── CC 2.1.29x: usage.iterations is [] on every line ────────────────────────
+echo ""
+echo "=== CC 2.1.29x regressions ==="
+
+echo "--- Test 47: iterations:[] / null / absent all sum the top-level usage"
+# CC 2.1.28x+ writes "iterations":[] on every main AND sub-agent assistant line. The
+# 2.1.2xx segment rule matched the bare "iterations":[ prefix, so the token segment became
+# the literal "iterations":[] and every sum was 0 — the main model's Σ row vanished
+# (rows with sum 0 are hidden) and only pre-2.1.28x sub-agent lines survived.
+# Runs through statusline.sh itself (production awk), with the fixture's sub-agent dir.
+T47="$FIXTURES/jsonl_iterations_empty.jsonl"; SID47="test-iterempty-$$"; SDIR47="/tmp/claude_session_${SID47}"
+rm -rf "$SDIR47"
+printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":200000,"used_percentage":33,"current_usage":{"input_tokens":1,"cache_creation_input_tokens":500,"cache_read_input_tokens":66335,"output_tokens":45}}}' "$SID47" "$T47" \
+  | bash "$SCRIPT" >/dev/null 2>&1
+MB47="$SDIR47/model_breakdown.txt"
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' "$MB47" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+mb47=$(cat "$MB47" 2>/dev/null)
+assert_contains "main [] + null lines summed (opus row non-zero)" \
+  "claude-opus-5-5 6 195787 0 2518 1001 1 0" "$mb47"
+assert_contains "2.1.290 sub-agent [] line summed (agent columns)" \
+  "claude-sonnet-5 0 0 0 0 0 0 0 2 32353 1396 0 4277 0 0 1" "$mb47"
+assert_contains "pre-iterations sub-agent line still summed (agent columns)" \
+  "claude-haiku-4-5-20251001 0 0 0 0 0 0 0 5 2000 100 0 50 0 0 1" "$mb47"
+rm -rf "$SDIR47"
+
+echo "--- Test 48: ttl tier read from top level when iterations is []"
+# Same root cause in the cache_log tier awk: [] made it log "0 0" for a live 1h write,
+# so the ttl countdown fell back to the 5m tier / expired.
+T48="/tmp/sltest-iterempty-ttl-$$.jsonl"; SID48="test-iterempty-ttl-$$"; SDIR48="/tmp/claude_session_${SID48}"
+rm -rf "$SDIR48"
+head -1 "$FIXTURES/jsonl_iterations_empty.jsonl" > "$T48"
+printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":200000,"used_percentage":33,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":818,"cache_read_input_tokens":64317,"output_tokens":836}}}' "$SID48" "$T48" \
+  | bash "$SCRIPT" >/dev/null 2>&1
+assert_eq "cache_log cw1h=818 from top level when iterations is []" "818" \
+  "$(awk 'END{print $3}' "$SDIR48/cache_log.txt" 2>/dev/null)"
+rm -rf "$SDIR48" "$T48"
+
+echo "--- Test 49: one API message = one count, keyed on message.id"
+# CC writes one JSONL line per content block, all sharing message.id. Sub-agent
+# streaming checkpoints repeat input/cache usage with GROWING output_tokens
+# (observed 2.1.290: 5, 5, 601), so the (model,in,out) fingerprint let 2-4 copies of
+# each call through and inflated input/cache sums 2-4x. Conversely two distinct calls
+# with identical small (in,out) were wrongly merged. message.id fixes both.
+bd49=$(run_breakdown "$FIXTURES/jsonl_msgid_checkpoints.jsonl")
+assert_contains "4 calls, last checkpoint wins (in=8 cr=58297 cw5m=350 out=1724)" \
+  "claude-sonnet-5 8 58297 350 0 1724 0 0" "$bd49"
+
+echo "--- Test 50: real 2.1.290 stdin (pretty + compact; mid-session and fresh)"
+# Captured from the live CLI 2.1.290 (paths anonymized). New since 2.1.2xx:
+# context_window.total_input_tokens/total_output_tokens (must not shadow current_usage),
+# a prompt_cache block, and on a fresh session current_usage:null + used_percentage:null
+# instead of zeros. rate_limits follows context_window in this sample; the scoping
+# keeps rate_limits.*.used_percentage out in either order.
+for _v in pretty compact; do
+  if [ "$_v" = pretty ]; then _in=$(cat "$FIXTURES/stdin_2.1.290.json")
+  else _in=$(tr -d '\n' < "$FIXTURES/stdin_2.1.290.json" | sed 's/  */ /g'); fi
+  out50=$(printf '%s' "$_in" | bash "$SCRIPT" 2>/dev/null | strip_ansi | head -1)
+  assert_contains "$_v: model Opus 5.5"            "Opus 5.5"            "$out50"
+  assert_contains "$_v: ctx 14%/1000k"             "ctx 14%/1000k"       "$out50"
+  assert_contains "$_v: harness cost"              "\$17.99"             "$out50"
+  assert_contains "$_v: tokens from current_usage" "↑2 +135kr +929w ↓577" "$out50"
+done
+out50f=$(bash "$SCRIPT" < "$FIXTURES/stdin_2.1.290_fresh.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "fresh (null usage): ctx 0%/1000k" "ctx 0%/1000k" "$out50f"
+assert_contains "fresh (null usage): zero tokens"  "↑0 +0r +0w ↓0" "$out50f"
+rm -rf /tmp/claude_session_test-stdin290*
+
+echo "--- Test 51: Mythos family — display name, ttl filter, fallback pricing"
+# claude-mythos-* ids rendered raw in Σ rows and priced at the $3/$15 unknown default
+# whenever the LiteLLM cache was missing. An empty cache file forces the fallback table.
+SID51="test-mythos-$$"; SDIR51="/tmp/claude_session_${SID51}"
+rm -rf "$SDIR51"; mkdir -p "$SDIR51"
+_now51=$(date +%s)
+echo "50:${_now51}" > "$SDIR51/last_api.ts"   # turn gate closed: prewritten files survive
+echo "$((_now51 - 20)) 0 6801 claude-mythos 73499 7 1000" > "$SDIR51/cache_log.txt"
+{
+  echo "claude-mythos-5-1 100000 0 0 0 20000 0 0"
+  echo "claude-fable-5-1[1m] 1000 0 0 0 1000 0 0"
+} > "$SDIR51/model_breakdown.txt"
+: > "/tmp/sltest-emptyprice-$$.txt"
+out51=$(printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-mythos-5-1","display_name":"Mythos 5.1"},"cost":{"total_cost_usd":1.0},"context_window":{"used_percentage":3,"context_window_size":1000000,"current_usage":{"input_tokens":2,"cache_read_input_tokens":54000,"cache_creation_input_tokens":37,"output_tokens":50}}}' "$SID51" \
+  | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice-$$.txt" bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "Σ row: claude-mythos-5-1 → Mythos 5.1"   "Mythos 5.1:" "$out51"
+assert_contains "Σ row: claude-fable-5-1[1m] → Fable 5.1" "Fable 5.1:"  "$out51"
+assert_contains "mythos fallback 10/50 → \$2.00 (not \$0.60)" "\$2.00" "$out51"
+assert_contains "ttl uses the claude-mythos family entry (73k)" "(73k)" "$(echo "$out51" | head -1)"
+rm -rf "$SDIR51" "/tmp/sltest-emptyprice-$$.txt"
+
+echo "--- Test 52: Σ rows split main vs sub-agent spend per model"
+# /usage (the harness ledger) lumps main and sub-agent spend together; the point of the Σ
+# rows is to see what sub-agents cost. Main file = first awk argument; each agent-*.jsonl
+# is one agent. Fable only in main, Sonnet only in 2 agents, Opus in main + 1 fleet agent.
+# Costs use the fallback table (empty pricing cache): Fable 5.1 10/50 with $0.25 reads,
+# Sonnet 5 2/10, Opus 5.5 4/20 with $0.20 reads.
+TA="$FIXTURES/jsonl_attrib.jsonl"; TAD="$FIXTURES/jsonl_attrib/subagents"
+bd52=$(run_breakdown "$TA" "$TAD/agent-t53d1.jsonl" "$TAD/agent-t53d2.jsonl" "$TAD/workflows/wf_t53/agent-t53d3.jsonl")
+assert_contains "main-only model: agent columns zero" \
+  "claude-fable-5-1 15000 3000000 0 100000 80000 1 0 0 0 0 0 0 0 0 0" "$bd52"
+assert_contains "agent-only model: main zero, 2 distinct agents" \
+  "claude-sonnet-5 0 0 0 0 0 0 0 11000 1100000 100000 0 11000 0 0 2" "$bd52"
+assert_contains "model in both: split columns, 1 agent" \
+  "claude-opus-5-5 20000 3000000 0 300000 60000 0 0 2000 200000 20000 0 3000 0 0 1" "$bd52"
+SID52="test-attrib-$$"; SDIR52="/tmp/claude_session_${SID52}"; rm -rf "$SDIR52"
+: > "/tmp/sltest-emptyprice52-$$.txt"
+_st52=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"id":"claude-fable-5-1","display_name":"Fable 5.1"},"cost":{"total_cost_usd":17.0},"context_window":{"context_window_size":1000000,"used_percentage":1,"current_usage":{"input_tokens":5000,"cache_creation_input_tokens":0,"cache_read_input_tokens":2000000,"output_tokens":30000}}}' "$SID52" "$TA")
+printf '%s' "$_st52" | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice52-$$.txt" bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' "$SDIR52/model_breakdown.txt" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+out52=$(printf '%s' "$_st52" | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice52-$$.txt" bash "$SCRIPT" 2>/dev/null | strip_ansi)
+assert_contains "main-only suffix (after +Nws)" "Fable 5.1: ↑15k +3.0Mr +100kw ↓80k = \$6.91 +1ws (main)" "$out52"
+assert_contains "agent-only suffix with count" "Sonnet 5: ↑11k +1.1Mr +100kw ↓11k = \$0.602 (agents ×2)" "$out52"
+assert_contains "both: total, then main \$X · agents ×N \$Y" \
+  "Opus 5.5: ↑22k +3.2Mr +320kw ↓63k = \$4.49 (main \$4.28 · agents ×1 \$0.208)" "$out52"
+assert_eq "local total = all models, main + agents (12.000)" "12.000000" "$(cat "$SDIR52/session_cost.txt" 2>/dev/null)"
+rm -rf "$SDIR52"
+# Legacy 8-column breakdown (written by the previous script, survives in /tmp until the
+# next regen): its columns mix main and agents, so the row renders with no suffix.
+mkdir -p "$SDIR52"; echo "50:$(date +%s)" > "$SDIR52/last_api.ts"
+echo "claude-fable-5-1 15000 3000000 0 100000 80000 1 0" > "$SDIR52/model_breakdown.txt"
+out52b=$(printf '%s' "$_st52" | sed 's/"output_tokens":30000/"output_tokens":50/' \
+  | CLAUDE_STATUSLINE_PRICING_CACHE="/tmp/sltest-emptyprice52-$$.txt" bash "$SCRIPT" 2>&1 | strip_ansi)
+assert_contains     "legacy 8-col row still priced" "Fable 5.1: ↑15k +3.0Mr +100kw ↓80k = \$6.91 +1ws" "$out52b"
+assert_not_contains "legacy row: no attribution suffix" "(main" "$out52b"
+rm -rf "$SDIR52" "/tmp/sltest-emptyprice52-$$.txt"
+
+echo "--- Test 53: effort level after the model name"
+for _v in pretty compact; do
+  if [ "$_v" = pretty ]; then _in=$(cat "$FIXTURES/stdin_2.1.290.json")
+  else _in=$(tr -d '\n' < "$FIXTURES/stdin_2.1.290.json" | sed 's/  */ /g'); fi
+  out53=$(printf '%s' "$_in" | bash "$SCRIPT" 2>/dev/null | strip_ansi | head -1)
+  assert_contains "$_v: 2.1.290 effort.level shown" "Opus 5.5 (medium) │ ctx" "$out53"
+done
+out53=$(bash "$SCRIPT" < "$FIXTURES/stdin-new-schema.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "compact one-line effort object (xhigh)" "(xhigh) │ ctx" "$out53"
+out53=$(bash "$SCRIPT" < "$FIXTURES/stdin-compact.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "no effort key: no parentheses" "Opus 4.7 │ ctx" "$out53"
+# Older shape {"display_name":"High","level":3}: numeric level is not a level name, and the
+# effort scope must not reach a later "level" key — render exactly as before.
+out53=$(bash "$SCRIPT" < "$FIXTURES/stdin-multi-display-name.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "numeric/legacy effort: no parentheses" "Opus 4.7 │ ctx" "$out53"
+rm -rf /tmp/claude_session_test-stdin290* /tmp/claude_session_test-multi-dn
+
+echo "--- Test 54: per-model cache rates — Opus 5.5 / Fable 5.1 cache reads are not 0.10x"
+# A fixed 0.10x cache-read multiplier overpriced the newest models: LiteLLM (and the harness,
+# matched to the micro-dollar on CC 2.1.290) bill Opus 5.5 reads at $0.20/M (0.05x of $4)
+# and Fable 5.1 / Mythos 5.1 reads at $0.25/M (0.025x of $10). Real Opus 5.5 call from
+# 2026-10-06: in 2, cache read 237146, 1h write 1523, out 830 → harness +$0.076221.
+SID54="test-cacherate-$$"; SDIR54="/tmp/claude_session_${SID54}"; P54="/tmp/sltest-price54-$$.txt"
+_run54() {   # $1 = pricing cache content ("" = empty file → fallback table)
+  rm -rf "$SDIR54"; mkdir -p "$SDIR54"; echo "50:$(date +%s)" > "$SDIR54/last_api.ts"
+  printf '%s\n' "${@:2}" > "$SDIR54/model_breakdown.txt"
+  printf '%s' "$1" > "$P54"
+  printf '{"session_id":"%s","transcript_path":"/dev/null","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"cost":{"total_cost_usd":1.0},"context_window":{"context_window_size":200000,"used_percentage":1,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":1,"output_tokens":50}}}' "$SID54" \
+    | CLAUDE_STATUSLINE_PRICING_CACHE="$P54" bash "$SCRIPT" >/dev/null 2>&1
+  cat "$SDIR54/session_cost.txt" 2>/dev/null
+}
+ROW54="claude-opus-5-5 2 237146 0 1523 830 0 0 0 0 0 0 0 0 0 0"
+assert_eq "6-col cache: Opus 5.5 call = harness \$0.076221" "0.076221" \
+  "$(_run54 "claude-opus-5-5 4 20 0.2 5 8" "$ROW54")"
+assert_eq "3-col (old) cache: multipliers still apply (0.123650)" "0.123650" \
+  "$(_run54 "claude-opus-5-5 4 20" "$ROW54")"
+assert_eq "no cache: fallback table has Opus 5.5 4/20 + 0.20 reads; Fable 5.1 0.25 reads" "0.326221" \
+  "$(_run54 "" "$ROW54" "claude-fable-5-1 0 1000000 0 0 0 0 0 0 0 0 0 0 0 0 0")"
+rm -rf "$SDIR54" "$P54"
+
+echo "--- Test 55: only web searches carry a per-request fee, not web fetches"
+# Anthropic bills web search at $10/1k requests; web fetch bills its tokens only. The
+# render charged (searches + fetches) x $0.01. 1M Sonnet 5 input ($2) + 2 searches + 3 fetches.
+assert_eq "2 searches billed, 3 fetches not (2.020000)" "2.020000" \
+  "$(_run54 "" "claude-sonnet-5 1000000 0 0 0 0 2 3 0 0 0 0 0 0 0 0")"
+assert_eq "agent-side fetches not billed either (2.000000)" "2.000000" \
+  "$(_run54 "" "claude-sonnet-5 0 0 0 0 0 0 0 1000000 0 0 0 0 0 4 1")"
+rm -rf "$SDIR54" "$P54"
+
+echo "--- Test 56: refresh-pricing.sh re-fetches only a pre-cache-rate (old format) cache"
+# Runs the script's own _old_format() check: stale when the file has lines and none has the
+# 6 fields; an empty file keeps the age check (offline tests rely on it), and one 6-field
+# line is enough — a model listed without cache rates must not force a fetch every turn.
+eval "$(grep '^_old_format()' "$ROOT/refresh-pricing.sh")"
+P56="/tmp/sltest-p56-$$.txt"
+printf 'claude-a 1 2\nclaude-b 3 4\n' > "$P56"
+assert_eq "3-field cache: stale" "stale" "$(_old_format "$P56" && echo stale || echo ok)"
+printf 'claude-a 1 2\nclaude-b 3 4 0.3 3.75 6\n' > "$P56"
+assert_eq "one 6-field line: not stale" "ok" "$(_old_format "$P56" && echo stale || echo ok)"
+: > "$P56"
+assert_eq "empty file: not stale (age check decides)" "ok" "$(_old_format "$P56" && echo stale || echo ok)"
+rm -f "$P56"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
