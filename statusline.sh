@@ -240,7 +240,7 @@ STATE_DIR="/tmp/claude_session_${session_id}"
 mkdir -p "$STATE_DIR" 2>/dev/null
 LAST_STATE="${STATE_DIR}/last_api.ts"
 SESSION_COST="${STATE_DIR}/session_cost.txt"
-MODEL_BREAKDOWN="${STATE_DIR}/model_breakdown.txt"  # space-delimited: model in cr cw5m cw1h out
+MODEL_BREAKDOWN="${STATE_DIR}/model_breakdown.txt"  # space-delimited, 16 cols: see the Σ render
 
 # Locate the most recent compact_boundary in the transcript (always, not just when ctx_pct==0).
 # Used for ctx% recovery and for the cache_log floor that guards stale pre-compact entries.
@@ -437,8 +437,8 @@ mb_regen_check() {
         done < <(find "$subagent_dir" -type f -name 'agent-*.jsonl' 2>/dev/null)
       fi
 
-      # Parse JSONL with awk: deduplicate by uuid, group by model, sum token counts
-      # Output format: "<model> <in> <cr> <cw5m> <cw1h> <out>" — one line per model
+      # Parse JSONL with awk: deduplicate by uuid and message.id, group by model and origin
+      # Output: one line per model, 16 columns (main sums, sub-agent sums, agent count)
       _mb_tmp="${MODEL_BREAKDOWN}.tmp.$$"
       ( : > "${_mb_tmp}.s"
         awk '
@@ -774,13 +774,15 @@ fi
 cache_timer_display="${_ttl_color}${_ttl_timer}($(fmt_tok $model_last_cached))${RESET}"
 
 # Top-line cost: harness total_cost_usd first, local transcript sum second. The harness
-# counter is per-PROCESS — it resets on CLI restart/resume and (CC 2.1.211+) on /clear —
-# and on CC 2.1.2xx it folds in background Workflow-fleet usage in near-real-time. The
-# local sum spans the whole transcript history (parent + subagents) at LiteLLM rates and
-# may lag a running fleet by up to the idle-probe interval + scan time. So harness>local
-# is normal shortly after fleet activity or on >8MB-per-turn undercount edge cases, and
-# local>harness is normal on any restarted/resumed/cleared session. Neither figure is
-# the authoritative Anthropic bill.
+# counter includes sub-agent calls as they land (measured on CC 2.1.290: each agent call
+# stepped the total by exactly its priced cost) plus internal calls no transcript records
+# (web search runs on Haiku). Since CC 2.1.246 it is persisted as a cost-state line at
+# process exit and restored on resume; it still resets on /clear and whenever a run fails
+# to restore it. The local sum spans the whole transcript history (parent + sub-agents)
+# at LiteLLM rates and may lag a running fleet by up to the idle-probe interval + scan
+# time. On 2.1.29x the two should be close; what separates them is internal calls, a
+# reset counter, /compact (harness only) and pricing-table drift. Neither figure is the
+# authoritative Anthropic bill.
 local_cost_val=$(cat "$SESSION_COST" 2>/dev/null | tr -d '[:space:]')
 have_harness=0; have_local=0
 [ -n "$cost" ] && awk -v v="$cost" 'BEGIN{exit !(v+0 > 0)}' 2>/dev/null && have_harness=1
@@ -809,11 +811,12 @@ printf "↑${WHITE}%s${RESET} ${GREEN}+%sr${RESET} ${YELLOW}+%sw${RESET} ↓${BL
 printf "%s hit ${hit_color}%s%%${RESET}" "${sep}" "$cache_pct"
 printf "%s ~ttl %s\n" "${sep}" "$cache_timer_display"
 
-# NOTE: Σ rows are computed from transcript JSONLs (parent + subagents). They
-# WILL NOT match /usage's per-model rows — /usage excludes subagent activity.
+# NOTE: Σ rows are computed from transcript JSONLs (parent + subagents), so each row can
+# split main vs sub-agent spend. /usage shows the harness ledger instead: per process and
+# unattributed, with internal calls the transcripts never see.
 # See README "Why the two cost figures differ".
 # Lines 2+: per-model totals — read directly from flat-text breakdown (no jq needed)
-# Columns: model in cr cw5m cw1h out web fetch
+# Columns: model, main in cr cw5m cw1h out web fetch, agent in cr cw5m cw1h out web fetch, agents
 total_cost=0
 if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
   # The Σ rows depend only on model_breakdown.txt (rewritten per-turn) and the pricing file
