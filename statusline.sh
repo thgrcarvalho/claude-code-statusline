@@ -32,7 +32,10 @@ iso_to_epoch() {
 # serialized before context_window; still true on 2.1.290). Token keys stay whole-buffer: current_usage was top-level
 # pre-2.1.187 and nested under context_window after, and a buffer-wide first match by exact key
 # (the leading quote stops "input_tokens" matching "cache_*_input_tokens" or "total_input_tokens")
-# finds the right value under both layouts. Emits 11 newline-separated values in a fixed order —
+# finds the right value under both layouts. effort.level (2.1.29x: low|medium|high|xhigh|max)
+# is scoped to the flat effort object, cut at its closing brace, so a later "level" key can
+# never win; older CLIs sent a numeric level there, which the string match ignores.
+# Emits 12 newline-separated values in a fixed order —
 # empty when a key is absent, so the reads below stay in sync.
 {
   read -r model
@@ -46,6 +49,7 @@ iso_to_epoch() {
   read -r tok_out
   read -r session_id
   read -r transcript_path
+  read -r effort
 } < <(printf '%s\n' "$input" | awk '
 function sval(s, key,   m) {
   if (match(s, "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\"")) {
@@ -85,6 +89,10 @@ END {
   print nval(buf, "output_tokens")
   print sval(buf, "session_id")
   print sval(buf, "transcript_path")
+  ei = index(buf, "\"effort\"")
+  eseg = (ei > 0) ? substr(buf, ei) : ""
+  ej = index(eseg, "}"); if (ej > 0) eseg = substr(eseg, 1, ej)
+  print sval(eseg, "level")
 }
 ')
 
@@ -778,8 +786,10 @@ fi
 sep="${DIM} │ ${RESET}"
 
 # Line 1: current turn
-printf "%s%s%s%s" \
-  "${BOLD}${CYAN}${model}${RESET}" "${sep}" \
+effort_str=""
+[ -n "$effort" ] && effort_str="${DIM} (${effort})${RESET}"
+printf "%s%s%s%s%s" \
+  "${BOLD}${CYAN}${model}${RESET}" "$effort_str" "${sep}" \
   "${ctx_str}" "${sep}"
 printf "%s%s" "$cost_display" "${sep}"
 printf "↑${WHITE}%s${RESET} ${GREEN}+%sr${RESET} ${YELLOW}+%sw${RESET} ↓${BLUE}%s${RESET}" \

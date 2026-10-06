@@ -1043,6 +1043,23 @@ assert_contains     "legacy 8-col row still priced" "Fable 5.1: ↑15k +3.0Mr +1
 assert_not_contains "legacy row: no attribution suffix" "(main" "$out52b"
 rm -rf "$SDIR52" "/tmp/sltest-emptyprice52-$$.txt"
 
+echo "--- Test 53: effort level after the model name"
+for _v in pretty compact; do
+  if [ "$_v" = pretty ]; then _in=$(cat "$FIXTURES/stdin_2.1.290.json")
+  else _in=$(tr -d '\n' < "$FIXTURES/stdin_2.1.290.json" | sed 's/  */ /g'); fi
+  out53=$(printf '%s' "$_in" | bash "$SCRIPT" 2>/dev/null | strip_ansi | head -1)
+  assert_contains "$_v: 2.1.290 effort.level shown" "Opus 5.5 (medium) │ ctx" "$out53"
+done
+out53=$(bash "$SCRIPT" < "$FIXTURES/stdin-new-schema.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "compact one-line effort object (xhigh)" "(xhigh) │ ctx" "$out53"
+out53=$(bash "$SCRIPT" < "$FIXTURES/stdin-compact.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "no effort key: no parentheses" "Opus 4.7 │ ctx" "$out53"
+# Older shape {"display_name":"High","level":3}: numeric level is not a level name, and the
+# effort scope must not reach a later "level" key — render exactly as before.
+out53=$(bash "$SCRIPT" < "$FIXTURES/stdin-multi-display-name.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "numeric/legacy effort: no parentheses" "Opus 4.7 │ ctx" "$out53"
+rm -rf /tmp/claude_session_test-stdin290* /tmp/claude_session_test-multi-dn
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
