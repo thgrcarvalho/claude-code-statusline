@@ -1094,6 +1094,20 @@ assert_eq "agent-side fetches not billed either (2.000000)" "2.000000" \
   "$(_run54 "" "claude-sonnet-5 0 0 0 0 0 0 0 1000000 0 0 0 0 0 4 1")"
 rm -rf "$SDIR54" "$P54"
 
+echo "--- Test 56: refresh-pricing.sh re-fetches only a pre-cache-rate (old format) cache"
+# Runs the script's own _old_format() check: stale when the file has lines and none has the
+# 6 fields; an empty file keeps the age check (offline tests rely on it), and one 6-field
+# line is enough — a model listed without cache rates must not force a fetch every turn.
+eval "$(grep '^_old_format()' "$ROOT/refresh-pricing.sh")"
+P56="/tmp/sltest-p56-$$.txt"
+printf 'claude-a 1 2\nclaude-b 3 4\n' > "$P56"
+assert_eq "3-field cache: stale" "stale" "$(_old_format "$P56" && echo stale || echo ok)"
+printf 'claude-a 1 2\nclaude-b 3 4 0.3 3.75 6\n' > "$P56"
+assert_eq "one 6-field line: not stale" "ok" "$(_old_format "$P56" && echo stale || echo ok)"
+: > "$P56"
+assert_eq "empty file: not stale (age check decides)" "ok" "$(_old_format "$P56" && echo stale || echo ok)"
+rm -f "$P56"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="

@@ -12,9 +12,12 @@ CACHE="/tmp/claude_pricing.txt"
 URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 MAX_AGE=86400   # 24h
 
-# A cache written before the cache-rate columns existed (3 fields per line) is stale
+# A cache written before the cache-rate columns existed (no line with 6 fields) is stale
 # regardless of age: it would keep pricing Opus 5.5 / Fable 5.1 reads at 0.10x for a day.
-if [ -f "$CACHE" ] && [ "$(awk 'NR == 1 { print NF; exit }' "$CACHE" 2>/dev/null)" != "3" ]; then
+# Any 6-field line counts, so a model LiteLLM lists without cache rates can't force a
+# refetch every turn. An empty file (no lines) keeps the age check.
+_old_format() { awk 'NF >= 6 { f = 1 } NF > 0 { n = 1 } END { exit !(n && !f) }' "$1" 2>/dev/null; }
+if [ -f "$CACHE" ] && ! _old_format "$CACHE"; then
   age=$(( $(date +%s) - $(stat -c %Y "$CACHE" 2>/dev/null || stat -f %m "$CACHE" 2>/dev/null || echo 0) ))
   [ "$age" -lt "$MAX_AGE" ] && exit 0
 fi
