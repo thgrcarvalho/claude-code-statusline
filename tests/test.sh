@@ -1156,33 +1156,39 @@ _al() { # $1=model $2=usage-object-body $3=extra top-level keys
 U1='"input_tokens":2,"cache_creation_input_tokens":500,"cache_read_input_tokens":99498,"output_tokens":40,"iterations":[]'
 U2='"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":100000,"output_tokens":7,"iterations":[]'
 J59="/tmp/sltest-j59-$$.jsonl"
-{ _al claude-opus-5-5 "$U1" ',"effort":"high"'; _al claude-opus-5-5 "$U2" ',"effort":"xhigh"'; } > "$J59"
+{ _al claude-opus-4-7 "$U1" ',"effort":"high"'; _al claude-opus-4-7 "$U2" ',"effort":"xhigh"'; } > "$J59"
 assert_eq "last line wins; ctx = in+cr+cw of 200k; effort = LAST top-level key" \
-  "|claude-opus-5-5|50.00|200||3|100000|0|7|S|T|xhigh" "$(_syn "$J59")"
-{ _al claude-opus-5-5 "$U2" ',"effort":"high"'; _al '<synthetic>' "$U1" ''; } > "$J59"
-assert_eq "<synthetic> line skipped" "|claude-opus-5-5|50.00|200||3|100000|0|7|S|T|high" "$(_syn "$J59")"
+  "|claude-opus-4-7|50.00|200||3|100000|0|7|S|T|xhigh" "$(_syn "$J59")"
+{ _al claude-opus-4-7 "$U2" ',"effort":"high"'; _al '<synthetic>' "$U1" ''; } > "$J59"
+assert_eq "<synthetic> line skipped" "|claude-opus-4-7|50.00|200||3|100000|0|7|S|T|high" "$(_syn "$J59")"
 UI='"input_tokens":1,"cache_creation_input_tokens":1,"cache_read_input_tokens":1,"output_tokens":1,"iterations":[{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":40000,"output_tokens":5},{"input_tokens":20,"cache_creation_input_tokens":980,"cache_read_input_tokens":49000,"output_tokens":6}]'
 _al claude-fable-5-1 "$UI" '' > "$J59"
 assert_eq "iterations:[{ → tokens summed, ctx from the LAST iteration, no effort" \
-  "|claude-fable-5-1|25.00|200||30|89000|980|11|S|T|" "$(_syn "$J59")"
+  "|claude-fable-5-1|5.00|1000||30|89000|980|11|S|T|" "$(_syn "$J59")"
 _al 'claude-fable-5-1[1m]' "$U2" ',"effort":3' > "$J59"
 assert_eq "[1m] id → 1000k window; numeric effort → empty" \
   "|claude-fable-5-1[1m]|10.00|1000||3|100000|0|7|S|T|" "$(_syn "$J59")"
+_al 'claude-fable-5-1[1m]' "$U2" '' > "$J59"
+assert_eq "[1m] wins over CLAUDE_STATUSLINE_CTX_SIZE" "1000" "$(_syn "$J59" 200000 | cut -d'|' -f4)"
 _al claude-opus-5-5 "$U2" '' > "$J59"
-assert_eq "CLAUDE_STATUSLINE_CTX_SIZE sets the window without [1m]" \
-  "|claude-opus-5-5|10.00|1000||3|100000|0|7|S|T|" "$(_syn "$J59" 1000000)"
+assert_eq "table: bare 5.x id → 1000k (CC 2.1.29x sends 1M for them)" "1000" "$(_syn "$J59" | cut -d'|' -f4)"
+assert_eq "CLAUDE_STATUSLINE_CTX_SIZE wins over the table" \
+  "|claude-opus-5-5|50.00|200||3|100000|0|7|S|T|" "$(_syn "$J59" 200000)"
+_al claude-opus-4-7 "$U2" '' > "$J59"
+assert_eq "table: bare 4.x id → 200k" "200" "$(_syn "$J59" | cut -d'|' -f4)"
+assert_eq "CLAUDE_STATUSLINE_CTX_SIZE sets a 4.x window" "1000" "$(_syn "$J59" 1000000 | cut -d'|' -f4)"
 U3='"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":250000,"output_tokens":7,"iterations":[]'
-_al claude-opus-5-5 "$U3" '' > "$J59"
-assert_eq "a call larger than 200k → the window is 1M (bare id)" \
-  "|claude-opus-5-5|25.00|1000||1|250000|0|7|S|T|" "$(_syn "$J59")"
+_al claude-opus-4-7 "$U3" '' > "$J59"
+assert_eq "a call larger than the 200k guess → the window is 1M" \
+  "|claude-opus-4-7|25.00|1000||1|250000|0|7|S|T|" "$(_syn "$J59")"
 printf '{"type":"user","message":{"role":"user","content":"hi"}}\n' > "$J59"
 assert_eq "no assistant line yet → zeros, no model" "||0.00|200||0|0|0|0|S|T|" "$(_syn "$J59")"
-{ _al claude-opus-5-5 "$U2" ''; printf '{"type":"system","subtype":"compact_boundary","compactMetadata":{"postTokens":30000}}\n'; } > "$J59"
+{ _al claude-opus-4-7 "$U2" ''; printf '{"type":"system","subtype":"compact_boundary","compactMetadata":{"postTokens":30000}}\n'; } > "$J59"
 assert_eq "compact_boundary after the last turn → ctx 0 (postTokens recovery runs)" \
-  "|claude-opus-5-5|0.00|200||3|100000|0|7|S|T|" "$(_syn "$J59")"
-_al claude-opus-5-5 "$U1" '' >> "$J59"
+  "|claude-opus-4-7|0.00|200||3|100000|0|7|S|T|" "$(_syn "$J59")"
+_al claude-opus-4-7 "$U1" '' >> "$J59"
 assert_eq "a turn after the boundary → its own ctx again" \
-  "|claude-opus-5-5|50.00|200||2|99498|500|40|S|T|" "$(_syn "$J59")"
+  "|claude-opus-4-7|50.00|200||2|99498|500|40|S|T|" "$(_syn "$J59")"
 rm -f "$J59"
 
 echo "--- Test 60: pane → session → transcript resolution"
@@ -1194,8 +1200,11 @@ cp "$FIXTURES/jsonl_attrib.jsonl" "$CD60/projects/-tmp-x/$SID60.jsonl"
 cp -R "$FIXTURES/jsonl_attrib" "$CD60/projects/-tmp-x/$SID60"
 cp "$FIXTURES/jsonl_attrib.jsonl" "$CD60/projects/-tmp-x/$SID60B.jsonl"
 printf '{"pid":999999,"sessionId":"%s","cwd":"/tmp/x"}' "$SID60B" > "$CD60/sessions/999999.json"
-sleep 30 & S60A=$!
-bash -c 'sleep 30; :' & S60P=$!          # a shell with a sleep below it: depth 2 under $$
+# Sleepers named "claude" (a copy of sleep): _session_of rejects pids that do not look like
+# Claude Code, so a recycled pid named in a stale sessions file is not taken for a session.
+BIN60="/tmp/sltest-bin-$$"; mkdir -p "$BIN60"; cp "$(command -v sleep)" "$BIN60/claude"
+"$BIN60/claude" 30 & S60A=$!
+bash -c "'$BIN60/claude' 30; :" & S60P=$!   # a shell with a "claude" below it: depth 2 under $$
 _i=0; S60B=""; while [ $_i -lt 30 ] && [ -z "$S60B" ]; do S60B=$(pgrep -P "$S60P" | head -1); [ -z "$S60B" ] && sleep 0.1; _i=$((_i+1)); done
 printf '{"pid":%s,"sessionId":"%s","cwd":"/tmp/x","version":"2.1.290"}' "$S60B" "$SID60B" > "$CD60/sessions/$S60B.json"
 PC60="/tmp/claude_statusline_pane_$$.txt"; rm -f "$PC60"
@@ -1229,7 +1238,12 @@ assert_eq "session without a transcript yet: empty, exit 0" "0:" "$rc:$out60"
 assert_eq "...and nothing cached" "no" "$([ -f "$PC60" ] && echo yes || echo no)"
 out60=$(CLAUDE_STATUSLINE_CLAUDE_DIR="$CD60" CLAUDE_STATUSLINE_DEBUG=1 bash "$SCRIPT" --pane 999999 2>&1 >/dev/null)
 assert_contains "CLAUDE_STATUSLINE_DEBUG=1 explains on stderr" "no Claude Code session" "$out60"
-kill "$S60A" "$S60P" "$S60B" 2>/dev/null; wait "$S60A" "$S60P" 2>/dev/null
+sleep 30 & S60C=$!
+printf '{"pid":%s,"sessionId":"%s"}' "$S60C" "$SID60" > "$CD60/sessions/$S60C.json"
+out60=$(_tm --pane $S60C); rc=$?
+assert_eq "recycled pid (live, but not Claude Code): rejected" "0:" "$rc:$out60"
+kill "$S60A" "$S60P" "$S60B" "$S60C" 2>/dev/null; wait "$S60A" "$S60P" "$S60C" 2>/dev/null
+rm -rf "$BIN60"; rm -f /tmp/claude_statusline_pane_$S60C.txt
 rm -f "$PC60" /tmp/claude_statusline_pane_999999.txt /tmp/claude_statusline_pane_$S60A.txt; rm -rf "$SH60"
 
 echo "--- Test 61: --session and --transcript targets"
@@ -1242,6 +1256,54 @@ out61=$(_tm --transcript "$CD60/projects/-tmp-x/$SID60.jsonl" | strip_ansi | hea
 assert_contains "--transcript renders that file" "Opus 5.5" "$out61"
 out61=$(_tm --transcript /nonexistent/x.jsonl); rc=$?
 assert_eq "missing --transcript file: empty, exit 0" "0:" "$rc:$out61"
+
+echo "--- Test 62: --tmux — tmux #[...] styles, no escapes, every # escaped"
+# The Σ breakdown is written in the background on the first render; wait for it, then the
+# second render has all three line groups.
+_tm --session "$SID60" >/dev/null
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' "/tmp/claude_session_$SID60/model_breakdown.txt" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+out62=$(_tm --session "$SID60" --tmux)
+assert_contains "bold cyan model" "#[bold]#[fg=cyan]Opus 5.5#[default]" "$out62"
+assert_contains "green / yellow / blue / brightwhite mapped" "#[fg=green]" "$out62"
+assert_contains "dim separators mapped" "#[dim] │ #[default]" "$out62"
+assert_eq "no ESC byte left" "0" "$(printf '%s' "$out62" | grep -c $'\033')"
+assert_eq "no bare # (only ## and #[)" "" "$(printf '%s' "$out62" | sed -e 's/##//g' -e 's/#\[//g' | grep '#')"
+assert_eq "4 lines: turn + 3 Σ rows" "4" "$(printf '%s\n' "$out62" | wc -l | tr -d ' ')"
+out62=$(printf 'a#b\n' | (eval "$(sed -n '/^  _tmux_fmt() {/,/^  }/p' "$SCRIPT")"; _tmux_fmt))
+assert_eq "literal # in content doubled" "a##b" "$out62"
+
+echo "--- Test 63: --line 1/2/3, single local cost"
+out63=$(_tm --session "$SID60" --line 1 | strip_ansi)
+assert_eq "--line 1: one line" "1" "$(printf '%s\n' "$out63" | wc -l | tr -d ' ')"
+assert_contains "--line 1: the turn line" "Opus 5.5 │ ctx" "$out63"
+assert_eq "one dollar value on the turn line (local sum, no harness)" "1" \
+  "$(printf '%s' "$out63" | grep -o '\$[0-9.]*' | wc -l | tr -d ' ')"
+assert_not_contains "no 'harness / local' pair" " / \$" "$out63"
+out63=$(_tm --session "$SID60" --line 2 | strip_ansi)
+assert_eq "--line 2: one line" "1" "$(printf '%s\n' "$out63" | wc -l | tr -d ' ')"
+assert_eq "--line 2: 3 Σ rows joined by ' │ '" "2" "$(printf '%s' "$out63" | grep -o ' │ Σ ' | wc -l | tr -d ' ')"
+assert_contains "--line 2: attribution suffix kept" "(main \$4.28 · agents ×1 \$0.208)" "$out63"
+assert_eq "--line 3: empty in transcript mode" "" "$(_tm --session "$SID60" --line 3)"
+
+echo "--- Test 64: /compact row and baseline suppressed in transcript mode"
+# Two compactions: the hook would price each from total_cost_usd; transcript mode has none and
+# must neither print "Σ /compact ×N: \$0" nor write compact_cost.txt.
+SID64="test-tm64-$$"; J64="$CD60/projects/-tmp-x/$SID64.jsonl"
+_b64() { printf '{"type":"system","subtype":"compact_boundary","timestamp":"%s","compactMetadata":{"postTokens":%s}}\n' "$1" "$2"; }
+{ _al claude-opus-5-5 "$U2" ''; } > "$J64"
+_tm --session "$SID64" >/dev/null; sleep 1.1   # floor must postdate the turn entry (1s clock)
+_b64 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" 40000 >> "$J64"; sleep 1.1
+out64=$(_tm --session "$SID64" | strip_ansi)
+assert_contains "after compact #1: postTokens ctx (40000/1000k = 4%)" "ctx 4%/1000k" "$out64"
+_al claude-opus-5-5 "$U1" '' >> "$J64"; _tm --session "$SID64" >/dev/null; sleep 1.1
+_b64 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" 30000 >> "$J64"; sleep 0.1
+out64=$(_tm --session "$SID64")
+assert_not_contains "no /compact row after two compactions" "/compact" "$out64"
+assert_eq "no compact_cost.txt written" "no" \
+  "$([ -f /tmp/claude_session_$SID64/compact_cost.txt ] || [ -f /tmp/claude_session_$SID64/transcript/compact_cost.txt ] && echo yes || echo no)"
+assert_eq "turn state kept apart from the hook's" "yes:no" \
+  "$([ -f /tmp/claude_session_$SID64/transcript/last_api.ts ] && echo yes || echo no):$([ -f /tmp/claude_session_$SID64/last_api.ts ] && echo yes || echo no)"
+rm -rf "/tmp/claude_session_$SID60" "/tmp/claude_session_$SID64"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""

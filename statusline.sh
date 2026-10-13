@@ -22,7 +22,7 @@ options:
                 3 = Σ /compact row (always empty in transcript mode: it needs the hook's cost)
   --help        this text
 Transcript mode prints nothing when no session is found. env: CLAUDE_STATUSLINE_CTX_SIZE
-(context window when the model id has no [1m] suffix, default 200000),
+(context window for ids without [1m]; default: 1M for 5.x+ models, 200k for older),
 CLAUDE_STATUSLINE_DEBUG=1 (resolution errors on stderr).
 EOF
 }
@@ -80,9 +80,18 @@ iso_to_epoch() {
 CLAUDE_DIR="${CLAUDE_STATUSLINE_CLAUDE_DIR:-$HOME/.claude}"   # env: tests only
 
 # sessionId of a LIVE Claude Code pid. <claude_dir>/sessions/<pid>.json (CC 2.1.27x+) maps a
-# running pid to its session; files of dead pids linger for weeks, hence kill -0.
+# running pid to its session; files of dead pids linger for weeks, hence kill -0. kill -0
+# alone trusts a recycled pid (a Mac up for weeks reuses them), so the process must also
+# look like Claude Code: "claude" (Linux reports the launcher symlink's name), "node" (npm
+# install) or the native build's own file name, a bare version (versions/2.1.295).
 _session_of() {
+  local comm
   [ -f "$CLAUDE_DIR/sessions/$1.json" ] && kill -0 "$1" 2>/dev/null || return 1
+  comm=$(ps -o comm= -p "$1" 2>/dev/null); comm="${comm##*/}"
+  case "$comm" in
+    *[Cc][Ll][Aa][Uu][Dd][Ee]*|node|node\ *|[0-9]*.[0-9]*.[0-9]*) ;;
+    *) _dbg "pid $1 is '$comm', not Claude Code: stale sessions file"; return 1 ;;
+  esac
   awk '{ buf = buf $0 } END {
     if (match(buf, /"sessionId"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
       v = substr(buf, RSTART, RLENGTH); sub(/^"sessionId"[[:space:]]*:[[:space:]]*"/, "", v)
@@ -259,9 +268,11 @@ END {
 #   array; CC 2.1.28x+ writes "iterations":[] everywhere, which reads the top level.
 # - ctx: the hook's current_usage is ONE API call, so the context size is in+cr+cw of the
 #   last iteration (the last occurrence of each key), not the iteration sum, which counts the
-#   re-read prompt once per pass. context_window_size is not in the transcript (CC 2.1.290):
-#   1M when the id carries [1m], else CLAUDE_STATUSLINE_CTX_SIZE, else 200k; and 1M once a
-#   call used more than that guess (CC 2.1.290 runs Opus 5.5 at 1M with a bare id).
+#   re-read prompt once per pass. context_window_size is not in the transcript (CC 2.1.290),
+#   so: [1m] suffix → 1M; else CLAUDE_STATUSLINE_CTX_SIZE; else a family table — 5.x and
+#   later → 1M, which is what claude.ai sends for them on 2.1.29x with bare ids (every Opus
+#   5.5 and Fable 5 hook entry at home: ctx_kb=1000), older → 200k. A gateway or Bedrock can
+#   serve a smaller window; the env var is the knob. A call larger than the guess → 1M.
 # - a compact_boundary after that line → ctx 0, so the existing postTokens recovery runs.
 # - effort = top-level "effort":"<level>", searched only after the usage object: it follows
 #   message, and a tool_use input (the Agent tool) can carry its own "effort" key in content.
@@ -313,7 +324,10 @@ END {
          + lastf(seg, "cache_creation_input_tokens")
     effort = lasts(useg, "effort")
   }
-  size = (index(model_id, "[1m]") > 0) ? 1000000 : ((ctxsize + 0 > 0) ? ctxsize + 0 : 200000)
+  if (index(model_id, "[1m]") > 0) size = 1000000
+  else if (ctxsize + 0 > 0) size = ctxsize + 0
+  else if (model_id ~ /^claude-(opus|sonnet|haiku|fable|mythos)-([5-9]|[1-9][0-9])/) size = 1000000
+  else size = 200000
   if (used > size && size < 1000000) size = 1000000
   print ""
   print model_id
