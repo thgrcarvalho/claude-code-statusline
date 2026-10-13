@@ -134,7 +134,7 @@ To stop backups from piling up, `install.sh` keeps only the **3 most recent back
 
 ## tmux status bar (no hook / managed-settings policy)
 
-Some managed Claude Code installs set `allowManagedHooksOnly` in their managed settings (see the [settings docs](https://docs.anthropic.com/en/docs/claude-code/settings)). That narrows `statusLine` to managed settings, so a user-level statusline never runs. Transcript mode renders the same line **outside** Claude Code, in the tmux status bar, from files Claude Code already writes. It changes no Claude Code setting, hook or plugin.
+Some managed Claude Code installs set `allowManagedHooksOnly` in their managed settings (see the [settings docs](https://code.claude.com/docs/en/settings-reference)). That narrows `statusLine` to managed settings, so a user-level statusline never runs. Transcript mode renders the same line **outside** Claude Code, in the tmux status bar, from files Claude Code already writes. It changes no Claude Code setting, hook or plugin.
 
 ```bash
 ./install.sh --tmux     # copies the scripts, leaves settings.json alone, prints the snippet
