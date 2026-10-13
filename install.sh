@@ -7,6 +7,16 @@ SETTINGS="$INSTALL_DIR/settings.json"
 CMD_PATH="$INSTALL_DIR/statusline.sh"
 MAX_BACKUPS=3   # keep only the most recent N backup generations; older ones are pruned on install
 
+# --tmux: install the scripts for a tmux status bar (statusline.sh --pane …) and leave
+# settings.json alone. For machines whose managed settings drop the user statusLine
+# (allowManagedHooksOnly): a statusLine key there would do nothing.
+TMUX_MODE=0
+case "${1:-}" in
+  "")     ;;
+  --tmux) TMUX_MODE=1 ;;
+  *)      echo "usage: $0 [--tmux]"; exit 2 ;;
+esac
+
 # Pre-flight checks
 check_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "Error: '$1' is required but not installed."; echo "  $2"; exit 1; }
@@ -113,7 +123,13 @@ PY
   echo "Updated $SETTINGS"
 }
 
-if [ -f "$SETTINGS" ]; then
+if [ "$TMUX_MODE" = 1 ]; then
+  # Marker in this backup generation: uninstall.sh then leaves settings.json alone. Without
+  # it, uninstall finds no saved statusLine value and removes the key — one this install
+  # never added.
+  : > "$SETTINGS.untouched.bak.$TS"
+  echo "Left $SETTINGS untouched (--tmux)"
+elif [ -f "$SETTINGS" ]; then
   _backup_statusline_value
   _patch_settings
 else
@@ -125,6 +141,20 @@ fi
 echo "Fetching initial pricing data..."
 "$INSTALL_DIR/refresh-pricing.sh" && echo "Pricing cache ready." || echo "Warning: pricing fetch failed (will retry on next Claude session)."
 
+if [ "$TMUX_MODE" = 1 ]; then
+  cat <<EOF
+
+Done. Add this to ~/.tmux.conf (tmux 2.9+), then: tmux source-file ~/.tmux.conf
+  set -g status 3
+  set -g status-interval 2
+  set -g status-format[1] '#($CMD_PATH --pane #{pane_pid} --tmux --line 1)'
+  set -g status-format[2] '#($CMD_PATH --pane #{pane_pid} --tmux --line 2)'
+Context window: 1M is assumed for 5.x models. If your gateway serves less, prefix the
+command: '#(CLAUDE_STATUSLINE_CTX_SIZE=200000 $CMD_PATH --pane ...)'.
+EOF
+  echo "To revert, run: $(cd "$(dirname "$0")" && pwd)/uninstall.sh"
+  exit 0
+fi
 echo ""
 echo "Done. Restart Claude Code to see the statusline."
 echo "To revert to your previous setup, run: $(cd "$(dirname "$0")" && pwd)/uninstall.sh"

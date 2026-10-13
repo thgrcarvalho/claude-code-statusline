@@ -1305,6 +1305,29 @@ assert_eq "turn state kept apart from the hook's" "yes:no" \
   "$([ -f /tmp/claude_session_$SID64/transcript/last_api.ts ] && echo yes || echo no):$([ -f /tmp/claude_session_$SID64/last_api.ts ] && echo yes || echo no)"
 rm -rf "/tmp/claude_session_$SID60" "/tmp/claude_session_$SID64"
 
+echo "--- Test 65: install.sh --tmux leaves settings.json byte-identical, uninstall too"
+# On a managed machine the user statusLine is dropped anyway; --tmux installs the scripts and
+# prints the tmux snippet. uninstall must not then "remove the key it added": it added none.
+touch /tmp/claude_pricing.txt 2>/dev/null   # fresh cache → refresh-pricing.sh exits early (no network)
+H65="/tmp/sltest-tmux-home-$$"; rm -rf "$H65"; mkdir -p "$H65/.claude"
+_s65='{"model":"opus","statusLine":{"type":"command","command":"/old/sl.sh"}}'
+printf '%s' "$_s65" > "$H65/.claude/settings.json"
+out65=$(HOME="$H65" bash "$ROOT/install.sh" --tmux 2>&1); rc=$?
+assert_eq       "--tmux install exits 0"                "0" "$rc"
+assert_eq       "settings.json untouched by install"    "$_s65" "$(cat "$H65/.claude/settings.json")"
+assert_eq       "statusline.sh installed"               "yes" "$([ -x "$H65/.claude/statusline.sh" ] && echo yes)"
+assert_contains "prints the status-format snippet"      "status-format[1] '#($H65/.claude/statusline.sh --pane #{pane_pid} --tmux --line 1)'" "$out65"
+assert_contains "names the context-size knob"           "CLAUDE_STATUSLINE_CTX_SIZE" "$out65"
+HOME="$H65" bash "$ROOT/uninstall.sh" >/dev/null 2>&1 </dev/null
+assert_eq       "settings.json untouched by uninstall"  "$_s65" "$(cat "$H65/.claude/settings.json")"
+assert_eq       "scripts removed (none before install)" "no" "$([ -e "$H65/.claude/statusline.sh" ] && echo yes || echo no)"
+rm -rf "$H65"; mkdir -p "$H65/.claude"
+HOME="$H65" bash "$ROOT/install.sh" --tmux >/dev/null 2>&1
+assert_eq       "no settings.json → none created"       "no" "$([ -e "$H65/.claude/settings.json" ] && echo yes || echo no)"
+out65=$(HOME="$H65" bash "$ROOT/install.sh" --bogus 2>&1); rc=$?
+assert_eq       "unknown install flag exits 2"          "2" "$rc"
+rm -rf "$H65"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "==========================================="
