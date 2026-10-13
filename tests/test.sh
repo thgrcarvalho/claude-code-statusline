@@ -48,7 +48,8 @@ assert_eq() {
 cleanup() { rm -rf /tmp/claude_session_test-* "${CD60:-}"; rm -f "${SIGMA_AWK:-}" "${TM_AWK:-}"; }
 trap cleanup EXIT
 
-strip_ansi() { sed 's/\x1b\[[0-9;]*[mGKHF]//g'; }
+# A literal ESC byte, not \x1b: BSD sed (macOS) has no \x escapes and matched nothing.
+strip_ansi() { sed $'s/\033\\[[0-9;]*[mGKHF]//g'; }
 
 # ─── JSONL breakdown awk: the production program, extracted from statusline.sh ──
 # Never mirror it here: a fix applied to only one copy passed CI while production broke

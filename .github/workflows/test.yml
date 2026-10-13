@@ -2,10 +2,23 @@ name: test
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # macOS is the pre-flight for the work Mac: stock /bin/bash 3.2 and BSD awk/sed/stat.
+      # The runner image also ships a Homebrew bash 5 on PATH; shadow it so every `bash` the
+      # tests spawn is 3.2. BSD awk and sed are already /usr/bin's.
+      - name: Use the system bash 3.2 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" && ln -sf /bin/bash "$RUNNER_TEMP/bin/bash"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Run tests
         run: |
+          bash --version | head -1; command -v awk sed
           chmod +x statusline.sh refresh-pricing.sh tests/test.sh
-          ./tests/test.sh
+          bash ./tests/test.sh
