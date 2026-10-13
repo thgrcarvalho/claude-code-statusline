@@ -87,7 +87,10 @@ CLAUDE_DIR="${CLAUDE_STATUSLINE_CLAUDE_DIR:-$HOME/.claude}"   # env: tests only
 _session_of() {
   local comm
   [ -f "$CLAUDE_DIR/sessions/$1.json" ] && kill -0 "$1" 2>/dev/null || return 1
-  comm=$(ps -o comm= -p "$1" 2>/dev/null); comm="${comm##*/}"
+  # /proc read is a builtin (Linux); ps is the portable path (macOS) but a fork per render.
+  if [ -r "/proc/$1/comm" ]; then read -r comm < "/proc/$1/comm"
+  else comm=$(ps -o comm= -p "$1" 2>/dev/null); fi
+  comm="${comm##*/}"
   case "$comm" in
     *[Cc][Ll][Aa][Uu][Dd][Ee]*|node|node\ *|[0-9]*.[0-9]*.[0-9]*) ;;
     *) _dbg "pid $1 is '$comm', not Claude Code: stale sessions file"; return 1 ;;
