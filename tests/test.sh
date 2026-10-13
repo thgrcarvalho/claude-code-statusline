@@ -45,7 +45,7 @@ assert_eq() {
   else _fail "$desc" "$expected" "$actual"; fi
 }
 
-cleanup() { rm -rf /tmp/claude_session_test-*; rm -f "${SIGMA_AWK:-}"; }
+cleanup() { rm -rf /tmp/claude_session_test-* "${CD60:-}"; rm -f "${SIGMA_AWK:-}" "${TM_AWK:-}"; }
 trap cleanup EXIT
 
 strip_ansi() { sed 's/\x1b\[[0-9;]*[mGKHF]//g'; }
@@ -1107,6 +1107,140 @@ assert_eq "one 6-field line: not stale" "ok" "$(_old_format "$P56" && echo stale
 : > "$P56"
 assert_eq "empty file: not stale (age check decides)" "ok" "$(_old_format "$P56" && echo stale || echo ok)"
 rm -f "$P56"
+
+# ─── Transcript mode (tmux status bar, no stdin hook) ────────────────────────
+echo ""
+echo "=== Transcript mode ==="
+
+echo "--- Test 57: golden — hook-mode output for the real 2.1.290 stdin is byte-identical"
+# Captured from v1.5.0 (317145d) before transcript mode existed. A fresh state dir pins the
+# ttl at the full 5:00, so the bytes are stable. The Σ variant runs the jsonl_attrib
+# transcript with a fixed pricing file; its ttl (wall clock) is cut and the Σ rows are
+# sorted (awk for-in order differs between gawk and BSD awk).
+rm -rf /tmp/claude_session_test-stdin290
+assert_eq "stdin_2.1.290.json: bytes unchanged" "$(cat "$FIXTURES/golden_stdin_2.1.290.out")" \
+  "$(bash "$SCRIPT" < "$FIXTURES/stdin_2.1.290.json" 2>/dev/null)"
+rm -rf /tmp/claude_session_test-stdin290 /tmp/claude_session_test-golden-b
+_st57=$(sed -e 's|"session_id": "test-stdin290"|"session_id": "test-golden-b"|' \
+  -e "s|/nonexistent/test-stdin290.jsonl|$FIXTURES/jsonl_attrib.jsonl|" "$FIXTURES/stdin_2.1.290.json")
+printf '%s' "$_st57" | CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' /tmp/claude_session_test-golden-b/model_breakdown.txt 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+out57=$(printf '%s' "$_st57" | CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" bash "$SCRIPT" 2>/dev/null \
+  | sed 's/~ttl .*/~ttl/' | { IFS= read -r _l; printf '%s\n' "$_l"; LC_ALL=C sort; })
+assert_eq "stdin + Σ rows: bytes unchanged" "$(cat "$FIXTURES/golden_stdin_2.1.290_sigma.out")" "$out57"
+rm -rf /tmp/claude_session_test-golden-b
+
+echo "--- Test 58: flags — usage, bad input exits 2, any flag skips stdin"
+out58=$(bash "$SCRIPT" --help 2>&1); rc=$?
+assert_eq "--help exits 0" "0" "$rc"
+assert_contains "--help prints usage" "statusline.sh --pane <pid>" "$out58"
+for _a in "--bogus" "--pane" "--pane 12x" "--line 4 --pane 1" "--tmux" "--line 1"; do
+  bash "$SCRIPT" $_a </dev/null >/dev/null 2>&1; rc=$?
+  assert_eq "'$_a' exits 2" "2" "$rc"
+done
+assert_eq "bad flag usage goes to stderr only" "" "$(bash "$SCRIPT" --bogus 2>/dev/null)"
+# stdin carries a different model: transcript mode must render the transcript, not read it
+out58=$(CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" bash "$SCRIPT" --transcript "$FIXTURES/jsonl_attrib.jsonl" \
+  < "$FIXTURES/stdin-compact.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "flags given: stdin JSON ignored" "Opus 5.5" "$out58"
+rm -rf /tmp/claude_session_jsonl_attrib
+
+echo "--- Test 59: synthesizer — the 12 hook values from the transcript tail"
+TM_AWK="/tmp/sltest-tm-$$.awk"
+sed -n '/^# >>> TRANSCRIPT_MODE/,/^# <<< TRANSCRIPT_MODE/p' "$SCRIPT" > "$TM_AWK"
+[ -s "$TM_AWK" ] || { echo "FATAL: TRANSCRIPT_MODE markers not found in statusline.sh" >&2; exit 1; }
+_syn() { awk -v sid=S -v tp=T -v ctxsize="${2:-}" -f "$TM_AWK" "$1" | paste -sd'|' -; }
+_al() { # $1=model $2=usage-object-body $3=extra top-level keys
+  printf '{"parentUuid":null,"isSidechain":false,"message":{"model":"%s","id":"msg_x","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t","name":"Agent","input":{"model":"sonnet","effort":"low"}}],"usage":{%s}},"type":"assistant","uuid":"u"%s}\n' "$1" "$2" "$3"; }
+U1='"input_tokens":2,"cache_creation_input_tokens":500,"cache_read_input_tokens":99498,"output_tokens":40,"iterations":[]'
+U2='"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":100000,"output_tokens":7,"iterations":[]'
+J59="/tmp/sltest-j59-$$.jsonl"
+{ _al claude-opus-5-5 "$U1" ',"effort":"high"'; _al claude-opus-5-5 "$U2" ',"effort":"xhigh"'; } > "$J59"
+assert_eq "last line wins; ctx = in+cr+cw of 200k; effort = LAST top-level key" \
+  "|claude-opus-5-5|50.00|200||3|100000|0|7|S|T|xhigh" "$(_syn "$J59")"
+{ _al claude-opus-5-5 "$U2" ',"effort":"high"'; _al '<synthetic>' "$U1" ''; } > "$J59"
+assert_eq "<synthetic> line skipped" "|claude-opus-5-5|50.00|200||3|100000|0|7|S|T|high" "$(_syn "$J59")"
+UI='"input_tokens":1,"cache_creation_input_tokens":1,"cache_read_input_tokens":1,"output_tokens":1,"iterations":[{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":40000,"output_tokens":5},{"input_tokens":20,"cache_creation_input_tokens":980,"cache_read_input_tokens":49000,"output_tokens":6}]'
+_al claude-fable-5-1 "$UI" '' > "$J59"
+assert_eq "iterations:[{ → tokens summed, ctx from the LAST iteration, no effort" \
+  "|claude-fable-5-1|25.00|200||30|89000|980|11|S|T|" "$(_syn "$J59")"
+_al 'claude-fable-5-1[1m]' "$U2" ',"effort":3' > "$J59"
+assert_eq "[1m] id → 1000k window; numeric effort → empty" \
+  "|claude-fable-5-1[1m]|10.00|1000||3|100000|0|7|S|T|" "$(_syn "$J59")"
+_al claude-opus-5-5 "$U2" '' > "$J59"
+assert_eq "CLAUDE_STATUSLINE_CTX_SIZE sets the window without [1m]" \
+  "|claude-opus-5-5|10.00|1000||3|100000|0|7|S|T|" "$(_syn "$J59" 1000000)"
+U3='"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":250000,"output_tokens":7,"iterations":[]'
+_al claude-opus-5-5 "$U3" '' > "$J59"
+assert_eq "a call larger than 200k → the window is 1M (bare id)" \
+  "|claude-opus-5-5|25.00|1000||1|250000|0|7|S|T|" "$(_syn "$J59")"
+printf '{"type":"user","message":{"role":"user","content":"hi"}}\n' > "$J59"
+assert_eq "no assistant line yet → zeros, no model" "||0.00|200||0|0|0|0|S|T|" "$(_syn "$J59")"
+{ _al claude-opus-5-5 "$U2" ''; printf '{"type":"system","subtype":"compact_boundary","compactMetadata":{"postTokens":30000}}\n'; } > "$J59"
+assert_eq "compact_boundary after the last turn → ctx 0 (postTokens recovery runs)" \
+  "|claude-opus-5-5|0.00|200||3|100000|0|7|S|T|" "$(_syn "$J59")"
+_al claude-opus-5-5 "$U1" '' >> "$J59"
+assert_eq "a turn after the boundary → its own ctx again" \
+  "|claude-opus-5-5|50.00|200||2|99498|500|40|S|T|" "$(_syn "$J59")"
+rm -f "$J59"
+
+echo "--- Test 60: pane → session → transcript resolution"
+# Fixture tree built per run: sessions/<pid>.json must name LIVE pids, so the test starts
+# its own sleepers and kills only those.
+CD60="/tmp/sltest-cd-$$"; SID60="test-tm60-$$"; SID60B="test-tm60b-$$"
+mkdir -p "$CD60/sessions" "$CD60/projects/-tmp-x"
+cp "$FIXTURES/jsonl_attrib.jsonl" "$CD60/projects/-tmp-x/$SID60.jsonl"
+cp -R "$FIXTURES/jsonl_attrib" "$CD60/projects/-tmp-x/$SID60"
+cp "$FIXTURES/jsonl_attrib.jsonl" "$CD60/projects/-tmp-x/$SID60B.jsonl"
+printf '{"pid":999999,"sessionId":"%s","cwd":"/tmp/x"}' "$SID60B" > "$CD60/sessions/999999.json"
+sleep 30 & S60A=$!
+bash -c 'sleep 30; :' & S60P=$!          # a shell with a sleep below it: depth 2 under $$
+_i=0; S60B=""; while [ $_i -lt 30 ] && [ -z "$S60B" ]; do S60B=$(pgrep -P "$S60P" | head -1); [ -z "$S60B" ] && sleep 0.1; _i=$((_i+1)); done
+printf '{"pid":%s,"sessionId":"%s","cwd":"/tmp/x","version":"2.1.290"}' "$S60B" "$SID60B" > "$CD60/sessions/$S60B.json"
+PC60="/tmp/claude_statusline_pane_$$.txt"; rm -f "$PC60"
+_tm() { CLAUDE_STATUSLINE_CLAUDE_DIR="$CD60" CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" bash "$SCRIPT" "$@" 2>/dev/null; }
+out60=$(_tm --pane $$ | strip_ansi | head -1)
+assert_contains "session two levels below the pane found" "Opus 5.5" "$out60"
+assert_contains "cache records claude pid + session" "$S60B	$SID60B	" "$(cat "$PC60" 2>/dev/null)"
+printf '{"pid":%s,"sessionId":"%s","cwd":"/tmp/x"}' "$S60A" "$SID60" > "$CD60/sessions/$S60A.json"
+rm -f "$PC60"
+_tm --pane $$ >/dev/null
+assert_contains "shallowest session wins" "$S60A	$SID60	" "$(cat "$PC60" 2>/dev/null)"
+# Cached: a valid entry is reused without find/pgrep (PATH shims log any call)
+SH60="/tmp/sltest-shim-$$"; mkdir -p "$SH60"
+for _c in find pgrep; do
+  printf '#!/bin/sh\necho %s >> %s/calls\nexec %s "$@"\n' "$_c" "$SH60" "$(command -v $_c)" > "$SH60/$_c"; chmod +x "$SH60/$_c"
+done
+PATH="$SH60:$PATH" _tm --pane $$ >/dev/null
+assert_eq "cached pane: no find/pgrep on the next render" "" "$(cat "$SH60/calls" 2>/dev/null)"
+# /clear or resume: the sessions file names a new session → re-resolved
+printf '{"pid":%s,"sessionId":"%s","cwd":"/tmp/x"}' "$S60A" "$SID60B" > "$CD60/sessions/$S60A.json"
+PATH="$SH60:$PATH" _tm --pane $$ >/dev/null
+assert_contains "sessionId changed → re-resolved" "$S60A	$SID60B	" "$(cat "$PC60" 2>/dev/null)"
+assert_contains "re-resolution ran find" "find" "$(cat "$SH60/calls" 2>/dev/null)"
+out60=$(_tm --pane 999999); rc=$?
+assert_eq "stale sessions file of a dead pid: empty output" "" "$out60"
+assert_eq "stale sessions file of a dead pid: exit 0" "0" "$rc"
+printf '{"pid":%s,"sessionId":"test-nofile-%s"}' "$S60A" "$$" > "$CD60/sessions/$S60A.json"
+rm -f "$PC60"
+out60=$(_tm --pane $S60A); rc=$?
+assert_eq "session without a transcript yet: empty, exit 0" "0:" "$rc:$out60"
+assert_eq "...and nothing cached" "no" "$([ -f "$PC60" ] && echo yes || echo no)"
+out60=$(CLAUDE_STATUSLINE_CLAUDE_DIR="$CD60" CLAUDE_STATUSLINE_DEBUG=1 bash "$SCRIPT" --pane 999999 2>&1 >/dev/null)
+assert_contains "CLAUDE_STATUSLINE_DEBUG=1 explains on stderr" "no Claude Code session" "$out60"
+kill "$S60A" "$S60P" "$S60B" 2>/dev/null; wait "$S60A" "$S60P" 2>/dev/null
+rm -f "$PC60" /tmp/claude_statusline_pane_999999.txt /tmp/claude_statusline_pane_$S60A.txt; rm -rf "$SH60"
+
+echo "--- Test 61: --session and --transcript targets"
+out61=$(_tm --session "$SID60" | strip_ansi | head -1)
+assert_contains "--session finds the transcript" "Opus 5.5" "$out61"
+assert_eq "--session caches the path" "$CD60/projects/-tmp-x/$SID60.jsonl" "$(cat /tmp/claude_session_$SID60/transcript_path.txt 2>/dev/null)"
+out61=$(_tm --session '../../etc'); rc=$?
+assert_eq "path-like session id refused silently" "0:" "$rc:$out61"
+out61=$(_tm --transcript "$CD60/projects/-tmp-x/$SID60.jsonl" | strip_ansi | head -1)
+assert_contains "--transcript renders that file" "Opus 5.5" "$out61"
+out61=$(_tm --transcript /nonexistent/x.jsonl); rc=$?
+assert_eq "missing --transcript file: empty, exit 0" "0:" "$rc:$out61"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
