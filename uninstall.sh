@@ -68,6 +68,7 @@ done
 # just the key we added. Any legacy settings.json.bak.<ts> full-file backup is left untouched.
 SETTINGS="$INSTALL_DIR/settings.json"
 SL_BAK="$SETTINGS.statusLine.bak.$TARGET_TS"
+SL_UNTOUCHED="$SETTINGS.untouched.bak.$TARGET_TS"   # written by install.sh --tmux
 
 _remove_statusline() {
   if command -v jq >/dev/null 2>&1; then
@@ -103,7 +104,10 @@ PY
   fi
 }
 
-if [ -f "$SETTINGS" ]; then
+if [ -f "$SL_UNTOUCHED" ]; then
+  echo "  Left $SETTINGS untouched (that install used --tmux)"
+  rm -f "$SL_UNTOUCHED"
+elif [ -f "$SETTINGS" ]; then
   if [ -f "$SL_BAK" ]; then
     _prev=$(cat "$SL_BAK" 2>/dev/null)
     if [ -z "$_prev" ] || [ "$_prev" = "null" ]; then

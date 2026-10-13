@@ -45,10 +45,11 @@ assert_eq() {
   else _fail "$desc" "$expected" "$actual"; fi
 }
 
-cleanup() { rm -rf /tmp/claude_session_test-*; rm -f "${SIGMA_AWK:-}"; }
+cleanup() { rm -rf /tmp/claude_session_test-* "${CD60:-}"; rm -f "${SIGMA_AWK:-}" "${TM_AWK:-}"; }
 trap cleanup EXIT
 
-strip_ansi() { sed 's/\x1b\[[0-9;]*[mGKHF]//g'; }
+# A literal ESC byte, not \x1b: BSD sed (macOS) has no \x escapes and matched nothing.
+strip_ansi() { sed $'s/\033\\[[0-9;]*[mGKHF]//g'; }
 
 # ─── JSONL breakdown awk: the production program, extracted from statusline.sh ──
 # Never mirror it here: a fix applied to only one copy passed CI while production broke
@@ -1107,6 +1108,296 @@ assert_eq "one 6-field line: not stale" "ok" "$(_old_format "$P56" && echo stale
 : > "$P56"
 assert_eq "empty file: not stale (age check decides)" "ok" "$(_old_format "$P56" && echo stale || echo ok)"
 rm -f "$P56"
+
+# ─── Transcript mode (tmux status bar, no stdin hook) ────────────────────────
+echo ""
+echo "=== Transcript mode ==="
+
+echo "--- Test 57: golden — hook-mode output for the real 2.1.290 stdin is byte-identical"
+# Captured from v1.5.0 (317145d) before transcript mode existed. A fresh state dir pins the
+# ttl at the full 5:00, so the bytes are stable. The Σ variant runs the jsonl_attrib
+# transcript with a fixed pricing file; its ttl (wall clock) is cut and the Σ rows are
+# sorted (awk for-in order differs between gawk and BSD awk).
+rm -rf /tmp/claude_session_test-stdin290
+assert_eq "stdin_2.1.290.json: bytes unchanged" "$(cat "$FIXTURES/golden_stdin_2.1.290.out")" \
+  "$(bash "$SCRIPT" < "$FIXTURES/stdin_2.1.290.json" 2>/dev/null)"
+rm -rf /tmp/claude_session_test-stdin290 /tmp/claude_session_test-golden-b
+_st57=$(sed -e 's|"session_id": "test-stdin290"|"session_id": "test-golden-b"|' \
+  -e "s|/nonexistent/test-stdin290.jsonl|$FIXTURES/jsonl_attrib.jsonl|" "$FIXTURES/stdin_2.1.290.json")
+printf '%s' "$_st57" | CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' /tmp/claude_session_test-golden-b/model_breakdown.txt 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+out57=$(printf '%s' "$_st57" | CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" bash "$SCRIPT" 2>/dev/null \
+  | sed 's/~ttl .*/~ttl/' | { IFS= read -r _l; printf '%s\n' "$_l"; LC_ALL=C sort; })
+assert_eq "stdin + Σ rows: bytes unchanged" "$(cat "$FIXTURES/golden_stdin_2.1.290_sigma.out")" "$out57"
+rm -rf /tmp/claude_session_test-golden-b
+
+echo "--- Test 58: flags — usage, bad input exits 2, any flag skips stdin"
+out58=$(bash "$SCRIPT" --help 2>&1); rc=$?
+assert_eq "--help exits 0" "0" "$rc"
+assert_contains "--help prints usage" "statusline.sh --pane <pid>" "$out58"
+for _a in "--bogus" "--pane" "--pane 12x" "--line 5 --pane 1" "--line 0 --turn-row 1 --pane 1" "--turn-row 2 --pane 1" "--tmux" "--line 1"; do
+  bash "$SCRIPT" $_a </dev/null >/dev/null 2>&1; rc=$?
+  assert_eq "'$_a' exits 2" "2" "$rc"
+done
+assert_eq "bad flag usage goes to stderr only" "" "$(bash "$SCRIPT" --bogus 2>/dev/null)"
+# stdin carries a different model: transcript mode must render the transcript, not read it
+out58=$(CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" bash "$SCRIPT" --transcript "$FIXTURES/jsonl_attrib.jsonl" \
+  < "$FIXTURES/stdin-compact.json" 2>/dev/null | strip_ansi | head -1)
+assert_contains "flags given: stdin JSON ignored" "Opus 5.5" "$out58"
+rm -rf /tmp/claude_session_jsonl_attrib
+
+echo "--- Test 59: synthesizer — the 12 hook values from the transcript tail"
+TM_AWK="/tmp/sltest-tm-$$.awk"
+sed -n '/^# >>> TRANSCRIPT_MODE/,/^# <<< TRANSCRIPT_MODE/p' "$SCRIPT" > "$TM_AWK"
+[ -s "$TM_AWK" ] || { echo "FATAL: TRANSCRIPT_MODE markers not found in statusline.sh" >&2; exit 1; }
+_syn() { awk -v sid=S -v tp=T -v ctxsize="${2:-}" -f "$TM_AWK" "$1" | paste -sd'|' -; }
+_al() { # $1=model $2=usage-object-body $3=extra top-level keys
+  printf '{"parentUuid":null,"isSidechain":false,"message":{"model":"%s","id":"msg_x","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t","name":"Agent","input":{"model":"sonnet","effort":"low"}}],"usage":{%s}},"type":"assistant","uuid":"u"%s}\n' "$1" "$2" "$3"; }
+U1='"input_tokens":2,"cache_creation_input_tokens":500,"cache_read_input_tokens":99498,"output_tokens":40,"iterations":[]'
+U2='"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":100000,"output_tokens":7,"iterations":[]'
+J59="/tmp/sltest-j59-$$.jsonl"
+{ _al claude-opus-4-7 "$U1" ',"effort":"high"'; _al claude-opus-4-7 "$U2" ',"effort":"xhigh"'; } > "$J59"
+assert_eq "last line wins; ctx = in+cr+cw of 200k; effort = LAST top-level key" \
+  "|claude-opus-4-7|50.00|200||3|100000|0|7|S|T|xhigh" "$(_syn "$J59")"
+{ _al claude-opus-4-7 "$U2" ',"effort":"high"'; _al '<synthetic>' "$U1" ''; } > "$J59"
+assert_eq "<synthetic> line skipped" "|claude-opus-4-7|50.00|200||3|100000|0|7|S|T|high" "$(_syn "$J59")"
+UI='"input_tokens":1,"cache_creation_input_tokens":1,"cache_read_input_tokens":1,"output_tokens":1,"iterations":[{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":40000,"output_tokens":5},{"input_tokens":20,"cache_creation_input_tokens":980,"cache_read_input_tokens":49000,"output_tokens":6}]'
+_al claude-fable-5-1 "$UI" '' > "$J59"
+assert_eq "iterations:[{ → tokens summed, ctx from the LAST iteration, no effort" \
+  "|claude-fable-5-1|5.00|1000||30|89000|980|11|S|T|" "$(_syn "$J59")"
+_al 'claude-fable-5-1[1m]' "$U2" ',"effort":3' > "$J59"
+assert_eq "[1m] id → 1000k window; numeric effort → empty" \
+  "|claude-fable-5-1[1m]|10.00|1000||3|100000|0|7|S|T|" "$(_syn "$J59")"
+_al 'claude-fable-5-1[1m]' "$U2" '' > "$J59"
+assert_eq "[1m] wins over CLAUDE_STATUSLINE_CTX_SIZE" "1000" "$(_syn "$J59" 200000 | cut -d'|' -f4)"
+_al claude-opus-5-5 "$U2" '' > "$J59"
+assert_eq "table: bare 5.x id → 1000k (CC 2.1.29x sends 1M for them)" "1000" "$(_syn "$J59" | cut -d'|' -f4)"
+assert_eq "CLAUDE_STATUSLINE_CTX_SIZE wins over the table" \
+  "|claude-opus-5-5|50.00|200||3|100000|0|7|S|T|" "$(_syn "$J59" 200000)"
+_al claude-opus-4-7 "$U2" '' > "$J59"
+assert_eq "table: bare 4.x id → 200k" "200" "$(_syn "$J59" | cut -d'|' -f4)"
+assert_eq "CLAUDE_STATUSLINE_CTX_SIZE sets a 4.x window" "1000" "$(_syn "$J59" 1000000 | cut -d'|' -f4)"
+U3='"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":250000,"output_tokens":7,"iterations":[]'
+_al claude-opus-4-7 "$U3" '' > "$J59"
+assert_eq "a call larger than the 200k guess → the window is 1M" \
+  "|claude-opus-4-7|25.00|1000||1|250000|0|7|S|T|" "$(_syn "$J59")"
+printf '{"type":"user","message":{"role":"user","content":"hi"}}\n' > "$J59"
+assert_eq "no assistant line yet → zeros, no model" "||0.00|200||0|0|0|0|S|T|" "$(_syn "$J59")"
+{ _al claude-opus-4-7 "$U2" ''; printf '{"type":"system","subtype":"compact_boundary","compactMetadata":{"postTokens":30000}}\n'; } > "$J59"
+assert_eq "compact_boundary after the last turn → ctx 0 (postTokens recovery runs)" \
+  "|claude-opus-4-7|0.00|200||3|100000|0|7|S|T|" "$(_syn "$J59")"
+_al claude-opus-4-7 "$U1" '' >> "$J59"
+assert_eq "a turn after the boundary → its own ctx again" \
+  "|claude-opus-4-7|50.00|200||2|99498|500|40|S|T|" "$(_syn "$J59")"
+rm -f "$J59"
+
+echo "--- Test 60: pane → session → transcript resolution"
+# Fixture tree built per run: sessions/<pid>.json must name LIVE pids, so the test starts
+# its own sleepers and kills only those.
+CD60="/tmp/sltest-cd-$$"; SID60="test-tm60-$$"; SID60B="test-tm60b-$$"
+mkdir -p "$CD60/sessions" "$CD60/projects/-tmp-x"
+cp "$FIXTURES/jsonl_attrib.jsonl" "$CD60/projects/-tmp-x/$SID60.jsonl"
+cp -R "$FIXTURES/jsonl_attrib" "$CD60/projects/-tmp-x/$SID60"
+cp "$FIXTURES/jsonl_attrib.jsonl" "$CD60/projects/-tmp-x/$SID60B.jsonl"
+printf '{"pid":999999,"sessionId":"%s","cwd":"/tmp/x"}' "$SID60B" > "$CD60/sessions/999999.json"
+# Sleepers named "claude" (a copy of sleep): _session_of rejects pids that do not look like
+# Claude Code, so a recycled pid named in a stale sessions file is not taken for a session.
+BIN60="/tmp/sltest-bin-$$"; mkdir -p "$BIN60"; cp "$(command -v sleep)" "$BIN60/claude"
+"$BIN60/claude" 30 & S60A=$!
+bash -c "'$BIN60/claude' 30; :" & S60P=$!   # a shell with a "claude" below it: depth 2 under $$
+_i=0; S60B=""; while [ $_i -lt 30 ] && [ -z "$S60B" ]; do S60B=$(pgrep -P "$S60P" | head -1); [ -z "$S60B" ] && sleep 0.1; _i=$((_i+1)); done
+printf '{"pid":%s,"sessionId":"%s","cwd":"/tmp/x","version":"2.1.290"}' "$S60B" "$SID60B" > "$CD60/sessions/$S60B.json"
+PC60="/tmp/claude_statusline_pane_$$.txt"; rm -f "$PC60"
+_tm() { CLAUDE_STATUSLINE_CLAUDE_DIR="$CD60" CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" bash "$SCRIPT" "$@" 2>/dev/null; }
+out60=$(_tm --pane $$ | strip_ansi | head -1)
+assert_contains "session two levels below the pane found" "Opus 5.5" "$out60"
+assert_contains "cache records claude pid + session" "$S60B	$SID60B	" "$(cat "$PC60" 2>/dev/null)"
+printf '{"pid":%s,"sessionId":"%s","cwd":"/tmp/x"}' "$S60A" "$SID60" > "$CD60/sessions/$S60A.json"
+rm -f "$PC60"
+_tm --pane $$ >/dev/null
+assert_contains "shallowest session wins" "$S60A	$SID60	" "$(cat "$PC60" 2>/dev/null)"
+# Cached: a valid entry is reused without find/pgrep (PATH shims log any call)
+SH60="/tmp/sltest-shim-$$"; mkdir -p "$SH60"
+for _c in find pgrep; do
+  printf '#!/bin/sh\necho %s >> %s/calls\nexec %s "$@"\n' "$_c" "$SH60" "$(command -v $_c)" > "$SH60/$_c"; chmod +x "$SH60/$_c"
+done
+PATH="$SH60:$PATH" _tm --pane $$ >/dev/null
+assert_eq "cached pane: no find/pgrep on the next render" "" "$(cat "$SH60/calls" 2>/dev/null)"
+# /clear or resume: the sessions file names a new session → re-resolved
+printf '{"pid":%s,"sessionId":"%s","cwd":"/tmp/x"}' "$S60A" "$SID60B" > "$CD60/sessions/$S60A.json"
+PATH="$SH60:$PATH" _tm --pane $$ >/dev/null
+assert_contains "sessionId changed → re-resolved" "$S60A	$SID60B	" "$(cat "$PC60" 2>/dev/null)"
+assert_contains "re-resolution ran find" "find" "$(cat "$SH60/calls" 2>/dev/null)"
+out60=$(_tm --pane 999999); rc=$?
+assert_eq "stale sessions file of a dead pid: empty output" "" "$out60"
+assert_eq "stale sessions file of a dead pid: exit 0" "0" "$rc"
+printf '{"pid":%s,"sessionId":"test-nofile-%s"}' "$S60A" "$$" > "$CD60/sessions/$S60A.json"
+rm -f "$PC60"
+out60=$(_tm --pane $S60A); rc=$?
+assert_eq "session without a transcript yet: empty, exit 0" "0:" "$rc:$out60"
+assert_eq "...and nothing cached" "no" "$([ -f "$PC60" ] && echo yes || echo no)"
+out60=$(CLAUDE_STATUSLINE_CLAUDE_DIR="$CD60" CLAUDE_STATUSLINE_DEBUG=1 bash "$SCRIPT" --pane 999999 2>&1 >/dev/null)
+assert_contains "CLAUDE_STATUSLINE_DEBUG=1 explains on stderr" "no Claude Code session" "$out60"
+sleep 30 & S60C=$!
+printf '{"pid":%s,"sessionId":"%s"}' "$S60C" "$SID60" > "$CD60/sessions/$S60C.json"
+out60=$(_tm --pane $S60C); rc=$?
+assert_eq "recycled pid (live, but not Claude Code): rejected" "0:" "$rc:$out60"
+kill "$S60A" "$S60P" "$S60B" "$S60C" 2>/dev/null; wait "$S60A" "$S60P" "$S60C" 2>/dev/null
+rm -rf "$BIN60"; rm -f /tmp/claude_statusline_pane_$S60C.txt
+rm -f "$PC60" /tmp/claude_statusline_pane_999999.txt /tmp/claude_statusline_pane_$S60A.txt; rm -rf "$SH60"
+
+echo "--- Test 61: --session and --transcript targets"
+out61=$(_tm --session "$SID60" | strip_ansi | head -1)
+assert_contains "--session finds the transcript" "Opus 5.5" "$out61"
+assert_eq "--session caches the path" "$CD60/projects/-tmp-x/$SID60.jsonl" "$(cat /tmp/claude_session_$SID60/transcript_path.txt 2>/dev/null)"
+out61=$(_tm --session '../../etc'); rc=$?
+assert_eq "path-like session id refused silently" "0:" "$rc:$out61"
+out61=$(_tm --transcript "$CD60/projects/-tmp-x/$SID60.jsonl" | strip_ansi | head -1)
+assert_contains "--transcript renders that file" "Opus 5.5" "$out61"
+out61=$(_tm --transcript /nonexistent/x.jsonl); rc=$?
+assert_eq "missing --transcript file: empty, exit 0" "0:" "$rc:$out61"
+
+echo "--- Test 62: --tmux — tmux #[...] styles, no escapes, every # escaped"
+# The Σ breakdown is written in the background on the first render; wait for it, then the
+# second render has all three line groups.
+_tm --session "$SID60" >/dev/null
+_i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-' "/tmp/claude_session_$SID60/model_breakdown.txt" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+out62=$(_tm --session "$SID60" --tmux)
+assert_contains "bold cyan model" "#[bold]#[fg=cyan]Opus 5.5#[default]" "$out62"
+assert_contains "green / yellow / blue / brightwhite mapped" "#[fg=green]" "$out62"
+assert_contains "dim separators mapped" "#[dim] │ #[default]" "$out62"
+assert_eq "no ESC byte left" "0" "$(printf '%s' "$out62" | grep -c $'\033')"
+assert_eq "no bare # (only ## and #[)" "" "$(printf '%s' "$out62" | sed -e 's/##//g' -e 's/#\[//g' | grep '#')"
+assert_eq "4 lines: turn + 3 Σ rows" "4" "$(printf '%s\n' "$out62" | wc -l | tr -d ' ')"
+out62=$(printf 'a#b\n' | (eval "$(sed -n '/^  _tmux_fmt() {/,/^  }/p' "$SCRIPT")"; _tmux_fmt))
+assert_eq "literal # in content doubled" "a##b" "$out62"
+
+echo "--- Test 63: --line 1/2/3, single local cost"
+out63=$(_tm --session "$SID60" --line 1 | strip_ansi)
+assert_eq "--line 1: one line" "1" "$(printf '%s\n' "$out63" | wc -l | tr -d ' ')"
+assert_contains "--line 1: the turn line" "Opus 5.5 │ ctx" "$out63"
+assert_eq "one dollar value on the turn line (local sum, no harness)" "1" \
+  "$(printf '%s' "$out63" | grep -o '\$[0-9.]*' | wc -l | tr -d ' ')"
+assert_not_contains "no 'harness / local' pair" " / \$" "$out63"
+# One Σ row per tmux row: --line 2/3 = first/second model, 4 = third (+ overflow, Test 66)
+full63=$(_tm --session "$SID60" | strip_ansi)
+assert_contains "Σ attribution suffix kept" "(main \$4.28 · agents ×1 \$0.208)" "$full63"
+for _n in 2 3 4; do
+  assert_eq "--line $_n = Σ row $((_n - 1))" "$(printf '%s\n' "$full63" | sed -n "${_n}p")" \
+    "$(_tm --session "$SID60" --line $_n | strip_ansi)"
+done
+
+echo "--- Test 64: /compact row and baseline suppressed in transcript mode"
+# Two compactions: the hook would price each from total_cost_usd; transcript mode has none and
+# must neither print "Σ /compact ×N: \$0" nor write compact_cost.txt.
+SID64="test-tm64-$$"; J64="$CD60/projects/-tmp-x/$SID64.jsonl"
+_b64() { printf '{"type":"system","subtype":"compact_boundary","timestamp":"%s","compactMetadata":{"postTokens":%s}}\n' "$1" "$2"; }
+{ _al claude-opus-5-5 "$U2" ''; } > "$J64"
+_tm --session "$SID64" >/dev/null; sleep 1.1   # floor must postdate the turn entry (1s clock)
+_b64 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" 40000 >> "$J64"; sleep 1.1
+out64=$(_tm --session "$SID64" | strip_ansi)
+assert_contains "after compact #1: postTokens ctx (40000/1000k = 4%)" "ctx 4%/1000k" "$out64"
+_al claude-opus-5-5 "$U1" '' >> "$J64"; _tm --session "$SID64" >/dev/null; sleep 1.1
+_b64 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" 30000 >> "$J64"; sleep 0.1
+out64=$(_tm --session "$SID64")
+assert_not_contains "no /compact row after two compactions" "/compact" "$out64"
+assert_eq "no compact_cost.txt written" "no" \
+  "$([ -f /tmp/claude_session_$SID64/compact_cost.txt ] || [ -f /tmp/claude_session_$SID64/transcript/compact_cost.txt ] && echo yes || echo no)"
+assert_eq "turn state kept apart from the hook's" "yes:no" \
+  "$([ -f /tmp/claude_session_$SID64/transcript/last_api.ts ] && echo yes || echo no):$([ -f /tmp/claude_session_$SID64/last_api.ts ] && echo yes || echo no)"
+rm -rf "/tmp/claude_session_$SID60" "/tmp/claude_session_$SID64"
+
+echo "--- Test 66: stacked Σ rows — overflow fold and the tmux resize via --socket"
+# 4 models: rows 2/3 one model each, row 4 the third and fourth joined. The --line 1 render
+# with --socket sets tmux status to 2 + min(rows, 3) once per change (PATH shim logs tmux).
+# The resize runs in the output filter after the render; $(...) waits for it like tmux #()
+# does (both read to EOF), a >/dev/null caller would not.
+SID66="test-tm66-$$"; J66="$CD60/projects/-tmp-x/$SID66.jsonl"; SD66="/tmp/claude_session_$SID66"
+_al claude-opus-5-5 "$U2" '' > "$J66"; touch -t 202001010000 "$J66"
+mkdir -p "$SD66"; echo "7:$(date +%s):0" > "$SD66/last_api.ts"; mkdir -p "$SD66/transcript"; cp "$SD66/last_api.ts" "$SD66/transcript/"
+printf '%s\n' "claude-opus-5-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" "claude-sonnet-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" \
+  "claude-fable-5-1 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" "claude-haiku-4-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" > "$SD66/model_breakdown.txt"
+full66=$(_tm --session "$SID66" | strip_ansi)
+assert_eq "4 Σ rows in the full render" "4" "$(printf '%s\n' "$full66" | grep -c '^Σ ')"
+r3=$(printf '%s\n' "$full66" | sed -n 4p); r4=$(printf '%s\n' "$full66" | sed -n 5p)
+assert_eq "--line 4 = Σ rows 3 and 4 joined" "$r3 │ $r4" "$(_tm --session "$SID66" --line 4 | strip_ansi)"
+assert_eq "--line 3 = Σ row 2 alone" "$(printf '%s\n' "$full66" | sed -n 3p)" "$(_tm --session "$SID66" --line 3 | strip_ansi)"
+SH66="/tmp/sltest-tmuxshim-$$"; mkdir -p "$SH66"; SOCK66="/tmp/sltest-sock-$$"
+printf '#!/bin/sh\necho "$*" >> %s/calls\n' "$SH66" > "$SH66/tmux"; chmod +x "$SH66/tmux"
+rm -f /tmp/claude_statusline_status_*sltest_sock_$$*
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --tmux --line 1)"
+assert_eq "4 rows → status 5 (capped), once" "-S $SOCK66 set -g status 5" "$(cat "$SH66/calls" 2>/dev/null)"
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --tmux --line 1)"
+assert_eq "unchanged count → no second set" "1" "$(wc -l < "$SH66/calls" | tr -d ' ')"
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --line 2)"
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --line 1)"
+assert_eq "no resize from --line 2, or without --socket" "1" "$(wc -l < "$SH66/calls" | tr -d ' ')"
+printf '%s\n' "claude-opus-5-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" > "$SD66/model_breakdown.txt"
+touch -t 203001010000 "$SD66/model_breakdown.txt"   # new mtime second: the Σ render cache keys on it
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --line 1)"
+assert_eq "1 row → status 3" "-S $SOCK66 set -g status 3" "$(tail -1 "$SH66/calls")"
+: "$(PATH="$SH66:$PATH" _tm --pane 999999 --socket "$SOCK66" --line 1)"
+assert_eq "no session under the pane → status 2" "-S $SOCK66 set -g status 2" "$(tail -1 "$SH66/calls")"
+rm -rf "$SH66" "$SD66" /tmp/claude_statusline_status_*sltest_sock_$$* /tmp/claude_statusline_pane_999999.txt
+
+echo "--- Test 67: no-window-list layout — turn line on row 0, four Σ rows, resize to 1+min(rows,4)"
+# Same row math, turn row 0: --line 0 = turn line, --turn-row 0 --line k = Σ row k, row 4
+# folds the fifth model in. tmux rejects status 1, so one row is "on".
+SID67="test-tm67-$$"; J67="$CD60/projects/-tmp-x/$SID67.jsonl"; SD67="/tmp/claude_session_$SID67"
+_al claude-opus-5-5 "$U2" '' > "$J67"; touch -t 202001010000 "$J67"
+mkdir -p "$SD67/transcript"; echo "7:$(date +%s):0" > "$SD67/transcript/last_api.ts"
+for _m in claude-opus-5-5 claude-sonnet-5 claude-fable-5-1 claude-haiku-4-5 claude-opus-4-7; do
+  echo "$_m 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0"; done > "$SD67/model_breakdown.txt"
+_tm --session "$SID67" >/dev/null   # warm-up: the first render writes the local cost after its top line
+full67=$(_tm --session "$SID67" | strip_ansi)
+_nottl() { strip_ansi | sed 's/~ttl.*//'; }
+_r() { printf '%s\n' "$full67" | sed -n "$1p"; }
+assert_eq "--line 0 = the turn line" "$(_r 1 | _nottl)" "$(_tm --session "$SID67" --line 0 | _nottl)"
+for _k in 1 2 3; do
+  assert_eq "--turn-row 0 --line $_k = Σ row $_k" "$(_r $((_k + 1)))" "$(_tm --session "$SID67" --turn-row 0 --line $_k | strip_ansi)"
+done
+assert_eq "--turn-row 0 --line 4 = Σ rows 4 and 5 joined" "$(_r 5) │ $(_r 6)" \
+  "$(_tm --session "$SID67" --turn-row 0 --line 4 | strip_ansi)"
+assert_eq "default turn row 1 unchanged: --line 1 = turn line" "$(_r 1 | _nottl)" "$(_tm --session "$SID67" --line 1 | _nottl)"
+SH67="/tmp/sltest-tmuxshim67-$$"; mkdir -p "$SH67"; SOCK67="/tmp/sltest-sock67-$$"
+printf '#!/bin/sh\necho "$*" >> %s/calls\n' "$SH67" > "$SH67/tmux"; chmod +x "$SH67/tmux"
+: "$(PATH="$SH67:$PATH" _tm --session "$SID67" --socket "$SOCK67" --tmux --line 0)"
+assert_eq "5 Σ rows → status 5 (1 + min(5, 4))" "-S $SOCK67 set -g status 5" "$(cat "$SH67/calls" 2>/dev/null)"
+: "$(PATH="$SH67:$PATH" _tm --session "$SID67" --socket "$SOCK67" --tmux --line 0)"
+: "$(PATH="$SH67:$PATH" _tm --session "$SID67" --socket "$SOCK67" --turn-row 0 --line 1)"
+assert_eq "unchanged, and Σ rows never resize" "1" "$(wc -l < "$SH67/calls" | tr -d ' ')"
+printf '%s\n' "claude-opus-5-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" "claude-sonnet-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" > "$SD67/model_breakdown.txt"
+touch -t 203001010000 "$SD67/model_breakdown.txt"   # new mtime second: the Σ render cache keys on it
+: "$(PATH="$SH67:$PATH" _tm --session "$SID67" --socket "$SOCK67" --line 0)"
+assert_eq "2 Σ rows → status 3" "-S $SOCK67 set -g status 3" "$(tail -1 "$SH67/calls")"
+: "$(PATH="$SH67:$PATH" _tm --pane 999999 --socket "$SOCK67" --line 0)"
+assert_eq "no session → one row, as 'on' (tmux rejects 1)" "-S $SOCK67 set -g status on" "$(tail -1 "$SH67/calls")"
+rm -rf "$SH67" "$SD67" /tmp/claude_statusline_status_*sltest_sock67_$$* /tmp/claude_statusline_pane_999999.txt
+
+echo "--- Test 65: install.sh --tmux leaves settings.json byte-identical, uninstall too"
+# On a managed machine the user statusLine is dropped anyway; --tmux installs the scripts and
+# prints the tmux snippet. uninstall must not then "remove the key it added": it added none.
+touch /tmp/claude_pricing.txt 2>/dev/null   # fresh cache → refresh-pricing.sh exits early (no network)
+H65="/tmp/sltest-tmux-home-$$"; rm -rf "$H65"; mkdir -p "$H65/.claude"
+_s65='{"model":"opus","statusLine":{"type":"command","command":"/old/sl.sh"}}'
+printf '%s' "$_s65" > "$H65/.claude/settings.json"
+out65=$(HOME="$H65" bash "$ROOT/install.sh" --tmux 2>&1); rc=$?
+assert_eq       "--tmux install exits 0"                "0" "$rc"
+assert_eq       "settings.json untouched by install"    "$_s65" "$(cat "$H65/.claude/settings.json")"
+assert_eq       "statusline.sh installed"               "yes" "$([ -x "$H65/.claude/statusline.sh" ] && echo yes)"
+assert_contains "prints the recommended snippet"       "status-format[0] '#($H65/.claude/statusline.sh --pane #{pane_pid} --socket #{socket_path} --tmux --line 0)'" "$out65"
+assert_contains "Σ rows know the turn row"             "status-format[4] '#($H65/.claude/statusline.sh --pane #{pane_pid} --turn-row 0 --tmux --line 4)'" "$out65"
+assert_contains "terminal-background status style"     "set -g status-style bg=default" "$out65"
+assert_contains "names the context-size knob"           "CLAUDE_STATUSLINE_CTX_SIZE" "$out65"
+HOME="$H65" bash "$ROOT/uninstall.sh" >/dev/null 2>&1 </dev/null
+assert_eq       "settings.json untouched by uninstall"  "$_s65" "$(cat "$H65/.claude/settings.json")"
+assert_eq       "scripts removed (none before install)" "no" "$([ -e "$H65/.claude/statusline.sh" ] && echo yes || echo no)"
+rm -rf "$H65"; mkdir -p "$H65/.claude"
+HOME="$H65" bash "$ROOT/install.sh" --tmux >/dev/null 2>&1
+assert_eq       "no settings.json → none created"       "no" "$([ -e "$H65/.claude/settings.json" ] && echo yes || echo no)"
+out65=$(HOME="$H65" bash "$ROOT/install.sh" --bogus 2>&1); rc=$?
+assert_eq       "unknown install flag exits 2"          "2" "$rc"
+rm -rf "$H65"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""

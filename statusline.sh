@@ -1,8 +1,72 @@
 #!/bin/bash
 # Claude Code status line — model · context % · cost · cache breakdown · per-model totals (incl. sub-agents)
 # Dependencies: bash 3.2+, awk, sed, grep (POSIX standard — no jq or python required)
-input=$(cat)
+#
+# Two modes. Hook mode (no arguments): Claude Code pipes the session JSON on stdin.
+# Transcript mode (any flag): renders the same line from the files Claude Code already writes
+# (~/.claude/sessions/<pid>.json + the session transcript), for a tmux status bar. That is the
+# compliant route where managed settings set allowManagedHooksOnly, which drops the user-level
+# statusLine; this mode reads files only and never touches Claude Code settings or hooks.
 export LC_ALL=C   # force period as decimal separator regardless of system locale
+
+_usage() {
+  cat <<'EOF'
+usage: statusline.sh                        hook mode: session JSON on stdin (statusLine)
+       statusline.sh --pane <pid> [opts]    transcript mode: the Claude Code session running
+                                            under a tmux pane (#{pane_pid})
+       statusline.sh --session <id> [opts]  transcript mode: a session id
+       statusline.sh --transcript <path> [opts]
+options:
+  --tmux        emit tmux #[...] styles instead of ANSI escapes
+  --line N      print the tmux status row N (0-4): the turn line when N is the turn row,
+                else per-model Σ row N - turn row; row 4, the last one tmux allows, also
+                takes every further Σ row joined with " │ ". The Σ /compact row needs the
+                hook's cost and is never shown in transcript mode.
+  --turn-row T  the row holding the turn line: 1 (default; row 0 keeps tmux's window list,
+                3 Σ rows fit) or 0 (no window list, 4 Σ rows fit). --line 0 implies 0.
+  --socket P    on the turn row's render: resize the tmux server at socket P
+                (#{socket_path}) to fit the Σ rows, only when that count changes
+  --help        this text
+Transcript mode prints nothing when no session is found. env: CLAUDE_STATUSLINE_CTX_SIZE
+(context window for ids without [1m]; default: 1M for 5.x+ models, 200k for older),
+CLAUDE_STATUSLINE_DEBUG=1 (resolution errors on stderr).
+EOF
+}
+_dbg() { [ "${CLAUDE_STATUSLINE_DEBUG:-}" = 1 ] && echo "statusline: $*" >&2; return 0; }
+
+mode=stdin; opt_pane=""; opt_session=""; opt_transcript=""; opt_tmux=0; opt_line=""; opt_socket=""; opt_turn=""
+# Any flag selects transcript mode, and stdin is never read there: tmux #() gives the command
+# no input, so a cat would only block or read garbage.
+if [ $# -gt 0 ]; then
+  mode=transcript
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h) _usage; exit 0 ;;
+      --tmux)    opt_tmux=1; shift; continue ;;
+      --pane|--session|--transcript|--line|--socket|--turn-row)
+        [ $# -ge 2 ] || { _usage >&2; exit 2; }   # bash 3.2 shift 2 with one arg left is a no-op
+        case "$1" in
+          --pane)       opt_pane="$2" ;;
+          --session)    opt_session="$2" ;;
+          --transcript) opt_transcript="$2" ;;
+          --line)       opt_line="$2" ;;
+          --socket)     opt_socket="$2" ;;
+          --turn-row)   opt_turn="$2" ;;
+        esac
+        shift 2 ;;
+      *) _usage >&2; exit 2 ;;
+    esac
+  done
+  case "$opt_pane" in *[!0-9]*) _usage >&2; exit 2 ;; esac
+  case "$opt_line" in ''|0|1|2|3|4) ;; *) _usage >&2; exit 2 ;; esac
+  [ -z "$opt_turn" ] && { [ "$opt_line" = 0 ] && opt_turn=0 || opt_turn=1; }
+  case "$opt_turn" in 0|1) ;; *) _usage >&2; exit 2 ;; esac
+  # A row above the turn line is tmux's window list, not ours.
+  [ -n "$opt_line" ] && [ "$opt_line" -lt "$opt_turn" ] && { _usage >&2; exit 2; }
+  [ -n "$opt_pane$opt_session$opt_transcript" ] || { _usage >&2; exit 2; }
+else
+  input=$(cat)
+fi
 
 # Colors
 RESET=$'\033[0m'
@@ -23,6 +87,159 @@ iso_to_epoch() {
   date -j -u -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null && return
   echo 0
 }
+
+# ── Transcript mode: pane → Claude Code pid → session → transcript ──────────────────────
+CLAUDE_DIR="${CLAUDE_STATUSLINE_CLAUDE_DIR:-$HOME/.claude}"   # env: tests only
+
+# sessionId of a LIVE Claude Code pid. <claude_dir>/sessions/<pid>.json (CC 2.1.27x+) maps a
+# running pid to its session; files of dead pids linger for weeks, hence kill -0. kill -0
+# alone trusts a recycled pid (a Mac up for weeks reuses them), so the process must also
+# look like Claude Code: "claude" (Linux reports the launcher symlink's name), "node" (npm
+# install) or the native build's own file name, a bare version (versions/2.1.295).
+_session_of() {
+  local comm
+  [ -f "$CLAUDE_DIR/sessions/$1.json" ] && kill -0 "$1" 2>/dev/null || return 1
+  # /proc read is a builtin (Linux); ps is the portable path (macOS) but a fork per render.
+  if [ -r "/proc/$1/comm" ]; then read -r comm < "/proc/$1/comm"
+  else comm=$(ps -o comm= -p "$1" 2>/dev/null); fi
+  comm="${comm##*/}"
+  case "$comm" in
+    *[Cc][Ll][Aa][Uu][Dd][Ee]*|node|node\ *|[0-9]*.[0-9]*.[0-9]*) ;;
+    *) _dbg "pid $1 is '$comm', not Claude Code: stale sessions file"; return 1 ;;
+  esac
+  awk '{ buf = buf $0 } END {
+    if (match(buf, /"sessionId"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+      v = substr(buf, RSTART, RLENGTH); sub(/^"sessionId"[[:space:]]*:[[:space:]]*"/, "", v)
+      sub(/"$/, "", v); print v
+    }
+  }' "$CLAUDE_DIR/sessions/$1.json" 2>/dev/null
+}
+
+# projects/<encoded cwd>/<id>.jsonl. The cwd encoding is Claude Code's (punctuation → "-")
+# and is not reimplemented: one bounded find, run only on (re)resolution — callers cache it.
+_transcript_of() {
+  find "$CLAUDE_DIR/projects" -mindepth 2 -maxdepth 2 -type f -name "$1.jsonl" 2>/dev/null | head -1
+}
+
+# Sets session_id + transcript_path for the Claude Code session under tmux pane <pid>.
+# Breadth-first below the pane (pgrep -P, depth ≤ 6, ≤ 64 pids) and the SHALLOWEST live
+# session wins: a claude started from a shell inside another claude is a child, and the
+# outer one is the conversation the pane shows. Cached per pane as
+# "<claude_pid>\t<session_id>\t<transcript>" and reused while that pid is alive and its
+# sessions file still names the same session (/clear and resume switch sessionId).
+_resolve_pane() {
+  local pane="$1" cache="/tmp/claude_statusline_pane_$1.txt"
+  local cpid="" csid="" cpath="" queue next p depth=0 n=0 sid path
+  [ -f "$cache" ] && IFS=$'\t' read -r cpid csid cpath < "$cache"
+  if [ -n "$cpid" ] && [ -n "$csid" ] && [ -f "$cpath" ] && [ "$(_session_of "$cpid")" = "$csid" ]; then
+    session_id=$csid; transcript_path=$cpath; return 0
+  fi
+  queue="$pane"
+  while [ -n "$queue" ] && [ "$depth" -le 6 ]; do
+    next=""
+    for p in $queue; do
+      n=$((n + 1)); [ "$n" -gt 64 ] && { _dbg "pane $pane: process walk capped at 64 pids"; return 1; }
+      sid=$(_session_of "$p")
+      if [ -n "$sid" ]; then
+        path=$(_transcript_of "$sid")
+        # A session that has not written its transcript yet renders nothing; not cached,
+        # so the next render retries.
+        [ -n "$path" ] || { _dbg "session $sid (pid $p): no transcript yet"; return 1; }
+        printf '%s\t%s\t%s\n' "$p" "$sid" "$path" > "${cache}.tmp.$$" 2>/dev/null \
+          && mv "${cache}.tmp.$$" "$cache" 2>/dev/null
+        session_id=$sid; transcript_path=$path; return 0
+      fi
+      next="$next $(pgrep -P "$p" 2>/dev/null | tr '\n' ' ')"
+    done
+    queue=$(echo $next)
+    depth=$((depth + 1))
+  done
+  _dbg "pane $pane: no Claude Code session below it"
+  return 1
+}
+
+# tmux status rows: rows 0..turn row, then one per Σ row, up to row 4 (tmux hard-codes 5
+# rows). Run by the turn row's render only, and only when the wanted value differs from the
+# last one this script set on that server: a `set` per render would redraw the bar every
+# status-interval. tmux takes "on" for one row; "1" is rejected (tmux 3.4).
+# Keyed per tmux socket, not per session: switching to a pane whose session has another
+# model count must resize even though neither session's count changed.
+_resize() {
+  local rows="${1:-0}" want last="" f
+  [ "$rows" -gt $((4 - opt_turn)) ] && rows=$((4 - opt_turn))
+  want=$((opt_turn + 1 + rows))
+  [ "$want" = 1 ] && want=on
+  f="/tmp/claude_statusline_status_${opt_socket//[!A-Za-z0-9]/_}.txt"
+  [ -f "$f" ] && read -r last < "$f"
+  [ "$last" = "$want" ] && return 0
+  tmux -S "$opt_socket" set -g status "$want" >/dev/null 2>&1 && echo "$want" > "$f" 2>/dev/null
+  return 0
+}
+# Nothing to render: a pane without Claude Code shrinks the bar to the empty turn row.
+_none() {
+  [ "$opt_line" = "$opt_turn" ] && [ -n "$opt_socket" ] && _resize 0
+  exit 0
+}
+
+if [ "$mode" = transcript ]; then
+  session_id=""; transcript_path=""
+  if [ -n "$opt_transcript" ]; then
+    transcript_path="$opt_transcript"; session_id=$(basename "$opt_transcript" .jsonl)
+  elif [ -n "$opt_session" ]; then
+    session_id="$opt_session"
+    case "$session_id" in *[!A-Za-z0-9_.-]*|.*) _dbg "bad session id '$session_id'"; _none ;; esac
+    _tp_cache="/tmp/claude_session_${session_id}/transcript_path.txt"
+    transcript_path=$(cat "$_tp_cache" 2>/dev/null)
+    if [ ! -f "$transcript_path" ]; then
+      transcript_path=$(_transcript_of "$session_id")
+      [ -n "$transcript_path" ] && mkdir -p "${_tp_cache%/*}" 2>/dev/null \
+        && echo "$transcript_path" > "$_tp_cache" 2>/dev/null
+    fi
+  else
+    _resolve_pane "$opt_pane" || _none
+  fi
+  # session_id names a /tmp state dir: anything but a plain id is refused, not sanitized.
+  case "$session_id" in ''|*[!A-Za-z0-9_.-]*|.*) _dbg "bad session id '$session_id'"; _none ;; esac
+  [ -f "$transcript_path" ] || { _dbg "no transcript for session $session_id"; _none; }
+
+  # Output filter, attached before anything is printed. --line picks one row (tmux #() keeps
+  # only the first line of a command's output, so each status-format row asks for its own);
+  # the /compact row is dropped from every selection (it is never rendered here); --tmux maps the SGR codes this script emits to tmux styles: #() output is
+  # parsed for #[...] but raw escapes are not interpreted. "#" in content is doubled first.
+  _post() {
+    local cf="" n=""
+    [ "$opt_line" = "$opt_turn" ] && [ -n "$opt_socket" ] && cf="/tmp/claude_statusline_rows.$$.$RANDOM"
+    # Σ row k = line - turn row; row 4 is tmux's last and folds every later Σ row into itself.
+    awk -v want="$opt_line" -v turn="$opt_turn" -v sep="${DIM} │ ${RESET}" \
+        -v cmark="Σ ${CYAN}/compact" -v cf="$cf" '
+      NR == 1          { if (want == "" || want == turn) print; next }
+      index($0, cmark) { if (want == "") print; next }
+      { n++; k = want - turn
+        if (want == "") print
+        else if (want < 4 && n == k) print
+        else if (want == 4 && n >= k) l4 = (l4 == "" ? $0 : l4 sep $0) }
+      END { if (l4 != "") print l4; if (cf != "") print n + 0 > cf }'
+    if [ -n "$cf" ]; then
+      read -r n 2>/dev/null < "$cf"; rm -f "$cf"
+      _resize "${n:-0}"
+    fi
+  }
+  _tmux_fmt() {
+    local e=$'\033'
+    sed -e 's/#/##/g' \
+        -e "s/${e}\[0m/#[default]/g"       -e "s/${e}\[1m/#[bold]/g" \
+        -e "s/${e}\[2m/#[dim]/g"           -e "s/${e}\[97m/#[fg=brightwhite]/g" \
+        -e "s/${e}\[36m/#[fg=cyan]/g"      -e "s/${e}\[32m/#[fg=green]/g" \
+        -e "s/${e}\[33m/#[fg=yellow]/g"    -e "s/${e}\[91m/#[fg=brightred]/g" \
+        -e "s/${e}\[34m/#[fg=blue]/g"      -e "s/${e}\[[0-9;]*m//g"
+  }
+  if [ "$opt_tmux" = 1 ]; then
+    exec > >(_post | _tmux_fmt)
+  elif [ -n "$opt_line" ]; then
+    exec > >(_post)
+  fi
+fi
+
 # Extract every stdin field in ONE awk pass (was ~11 grep|sed pipelines ≈ 55 forks per render).
 # Handles compact and pretty-printed JSON by joining all input into one buffer, then matching by
 # exact key name. display_name/id are scoped to the model section (effort/output_style also carry
@@ -37,20 +254,8 @@ iso_to_epoch() {
 # never win; older CLIs sent a numeric level there, which the string match ignores.
 # Emits 12 newline-separated values in a fixed order —
 # empty when a key is absent, so the reads below stay in sync.
-{
-  read -r model
-  read -r model_id
-  read -r ctx_pct
-  read -r ctx_kb
-  read -r cost
-  read -r tok_fresh
-  read -r tok_cr
-  read -r tok_cw
-  read -r tok_out
-  read -r session_id
-  read -r transcript_path
-  read -r effort
-} < <(printf '%s\n' "$input" | awk '
+_parse_stdin() {
+  printf '%s\n' "$input" | awk '
 function sval(s, key,   m) {
   if (match(s, "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\"")) {
     m = substr(s, RSTART, RLENGTH)
@@ -94,7 +299,130 @@ END {
   ej = index(eseg, "}"); if (ej > 0) eseg = substr(eseg, 1, ej)
   print sval(eseg, "level")
 }
-')
+'
+}
+
+# Transcript mode: the same 12 values, synthesized from the tail of the main transcript.
+# Source = the newest main-conversation API response (sub-agent files feed only the Σ rows,
+# through the breakdown below). tail -c bounds the read: renders run every few seconds and
+# transcripts reach hundreds of MB, while the line we want sits at the end; a tail with no
+# such line renders as a fresh session (zeros, model "?").
+# Field rules, each mirroring what the hook would send:
+# - model_id = message.model, first match (message.model precedes content, and tool_use
+#   inputs in content are unescaped objects that can carry their own "model" key). [1m] is
+#   kept; pricing_for strips it. The display name is derived later by model_display.
+# - tokens: the usage object is the LAST "usage":{ on the line (it follows content). Same
+#   iterations rule as SIGMA_AWK: only a non-empty "iterations":[{ scopes the sum to the
+#   array; CC 2.1.28x+ writes "iterations":[] everywhere, which reads the top level.
+# - ctx: the hook's current_usage is ONE API call, so the context size is in+cr+cw of the
+#   last iteration (the last occurrence of each key), not the iteration sum, which counts the
+#   re-read prompt once per pass. context_window_size is not in the transcript (CC 2.1.290),
+#   so: [1m] suffix → 1M; else CLAUDE_STATUSLINE_CTX_SIZE; else a family table — 5.x and
+#   later → 1M, which is what claude.ai sends for them on 2.1.29x with bare ids (every Opus
+#   5.5 and Fable 5 hook entry at home: ctx_kb=1000), older → 200k. A gateway or Bedrock can
+#   serve a smaller window; the env var is the knob. A call larger than the guess → 1M.
+# - a compact_boundary after that line → ctx 0, so the existing postTokens recovery runs.
+# - effort = top-level "effort":"<level>", searched only after the usage object: it follows
+#   message, and a tool_use input (the Agent tool) can carry its own "effort" key in content.
+# - cost stays empty: total_cost_usd exists only on the hook stdin.
+_synth() {
+  tail -c 4194304 "$transcript_path" 2>/dev/null | awk -v sid="$session_id" \
+    -v tp="$transcript_path" -v ctxsize="${CLAUDE_STATUSLINE_CTX_SIZE:-}" '
+# >>> TRANSCRIPT_MODE (tests/test.sh extracts and runs this exact program)
+function sumf(s, name,   t, f, tot) {
+  tot = 0; t = s
+  while (match(t, "\"" name "\":[0-9]+")) {
+    f = substr(t, RSTART, RLENGTH); sub(".*:", "", f); tot += f + 0
+    t = substr(t, RSTART + RLENGTH)
+  }
+  return tot
+}
+function lastf(s, name,   t, f, v) {
+  v = 0; t = s
+  while (match(t, "\"" name "\":[0-9]+")) {
+    f = substr(t, RSTART, RLENGTH); sub(".*:", "", f); v = f + 0
+    t = substr(t, RSTART + RLENGTH)
+  }
+  return v
+}
+function lasts(s, name,   t, f, v) {
+  v = ""; t = s
+  while (match(t, "\"" name "\":\"[^\"]*\"")) {
+    f = substr(t, RSTART, RLENGTH); sub("^\"" name "\":\"", "", f); sub("\"$", "", f); v = f
+    t = substr(t, RSTART + RLENGTH)
+  }
+  return v
+}
+/"type":"assistant"/ && /"role":"assistant"/ && /"usage":[{]/ {
+  if (index($0, "\"model\":\"<synthetic>\"") || index($0, "\"type\":\"progress\"")) next
+  last = $0; compacted = 0; next
+}
+/"subtype":"compact_boundary"/ { compacted = 1 }
+END {
+  model_id = ""; in_t = 0; cr = 0; cw = 0; out = 0; used = 0; effort = ""
+  if (last != "") {
+    if (match(last, /"model":"[^"]*"/)) model_id = substr(last, RSTART + 9, RLENGTH - 10)
+    u = last; while ((p = index(u, "\"usage\":{")) > 0) { useg = substr(u, p); u = substr(u, p + 9) }
+    seg = useg
+    p = index(useg, "\"iterations\":[{")
+    if (p > 0) { seg = substr(useg, p); q = index(seg, "]"); if (q > 0) seg = substr(seg, 1, q) }
+    in_t = sumf(seg, "input_tokens"); cr = sumf(seg, "cache_read_input_tokens")
+    cw = sumf(seg, "cache_creation_input_tokens"); out = sumf(seg, "output_tokens")
+    used = lastf(seg, "input_tokens") + lastf(seg, "cache_read_input_tokens") \
+         + lastf(seg, "cache_creation_input_tokens")
+    effort = lasts(useg, "effort")
+  }
+  if (index(model_id, "[1m]") > 0) size = 1000000
+  else if (ctxsize + 0 > 0) size = ctxsize + 0
+  else if (model_id ~ /^claude-(opus|sonnet|haiku|fable|mythos)-([5-9]|[1-9][0-9])/) size = 1000000
+  else size = 200000
+  if (used > size && size < 1000000) size = 1000000
+  print ""
+  print model_id
+  printf "%.2f\n", (compacted ? 0 : used * 100 / size)
+  print int(size / 1000)
+  print ""
+  print in_t; print cr; print cw; print out
+  print sid; print tp
+  print effort
+}
+# <<< TRANSCRIPT_MODE
+'
+}
+
+# The synthesized values are a pure function of the transcript, so cache them keyed on its
+# size+mtime (plus the context-size override): idle renders, the common case at a 2s tmux
+# status-interval, then cost two stats and a cat instead of a 4 MB tail through awk.
+_synth_cached() {
+  local c="/tmp/claude_session_${session_id}/transcript_synth.cache" key k
+  key="$(stat -c '%s:%Y' "$transcript_path" 2>/dev/null || stat -f '%z:%m' "$transcript_path" 2>/dev/null):${CLAUDE_STATUSLINE_CTX_SIZE:-}"
+  [ -f "$c" ] && IFS= read -r k < "$c"
+  if [ "$k" = "$key" ]; then
+    tail -n +2 "$c"
+  else
+    mkdir -p "${c%/*}" 2>/dev/null
+    if { echo "$key"; _synth; } > "${c}.tmp.$$" 2>/dev/null && mv "${c}.tmp.$$" "$c" 2>/dev/null; then
+      tail -n +2 "$c"
+    else
+      rm -f "${c}.tmp.$$" 2>/dev/null; _synth
+    fi
+  fi
+}
+
+{
+  read -r model
+  read -r model_id
+  read -r ctx_pct
+  read -r ctx_kb
+  read -r cost
+  read -r tok_fresh
+  read -r tok_cr
+  read -r tok_cw
+  read -r tok_out
+  read -r session_id
+  read -r transcript_path
+  read -r effort
+} < <(if [ "$mode" = stdin ]; then _parse_stdin; else _synth_cached; fi)
 
 model="${model:-?}"
 ctx_pct="${ctx_pct:-0}"
@@ -146,6 +474,8 @@ model_display() {
   # Already a display name from harness JSON ("Opus 4.7"), or unknown — pass through
   echo "$id"
 }
+# Transcript mode has only the id; the hook sends display_name alongside it.
+[ "$mode" = transcript ] && [ -n "$model_id" ] && model=$(model_display "$model_id")
 
 # Pricing: base_input output cache_read cache_write_5m cache_write_1h (USD per million tokens).
 # Live rates read from /tmp/claude_pricing.txt if refresh-pricing.sh has run (requires jq).
@@ -238,7 +568,14 @@ else ctx_color=$RED; fi
 # State dir per session (defined early so the compact-boundary cache below can live here).
 STATE_DIR="/tmp/claude_session_${session_id}"
 mkdir -p "$STATE_DIR" 2>/dev/null
-LAST_STATE="${STATE_DIR}/last_api.ts"
+# Turn state (turn marker, cache_log) is per mode. The hook and a tmux bar can render the
+# same session at once, and they read tok_out from different sources (stdin current_usage vs
+# the last transcript line, which can lag or differ on multi-iteration turns): sharing the
+# marker would flap the turn gate between them and restart the ttl on every render. The Σ
+# breakdown and its caches below are pure functions of the files and stay shared.
+TURN_DIR="$STATE_DIR"
+[ "$mode" = transcript ] && TURN_DIR="${STATE_DIR}/transcript" && mkdir -p "$TURN_DIR" 2>/dev/null
+LAST_STATE="${TURN_DIR}/last_api.ts"
 SESSION_COST="${STATE_DIR}/session_cost.txt"
 MODEL_BREAKDOWN="${STATE_DIR}/model_breakdown.txt"  # space-delimited, 16 cols: see the Σ render
 
@@ -316,36 +653,40 @@ COMPACT_STATE="${STATE_DIR}/compact_cost.txt"
 _cc_now=$(echo "${cost:-0}" | awk '{printf "%.6f", $1+0}')
 _cc_floor="${compact_floor_ts:-0}"
 compact_count=0; compact_total=0; _cc_prev_cost=""; _cc_prev_floor=""
-if [ -f "$COMPACT_STATE" ]; then
-  read -r compact_count compact_total _cc_prev_cost _cc_prev_floor < "$COMPACT_STATE"
-fi
-compact_count="${compact_count:-0}"; compact_total="${compact_total:-0}"
-# Only count once we have a prior baseline (don't retroactively price compacts that
-# predate this feature — their deltas were never captured). A non-zero floor change
-# since the last render means a new compaction just completed.
-if [ -n "$_cc_prev_floor" ] && [ "$_cc_floor" != "$_cc_prev_floor" ] && [ "$_cc_floor" != "0" ]; then
-  # Baseline = cost at the last completed turn, not the previous render. A long compaction
-  # (seconds to minutes) makes the harness bump total_cost_usd a render or two BEFORE the
-  # compact_boundary line lands in the transcript, so the previous render already shows the
-  # higher cost and a render-to-render delta collapses to 0. The last *turn* cost is a stable
-  # pre-compact anchor — nothing meaningful bills between a turn and a compaction except the
-  # compaction itself (plus negligible internal Haiku). LAST_STATE col 3 holds it; fall back
-  # to the previous render's cost for pre-upgrade sessions that haven't rewritten LAST_STATE.
-  _cc_base=$(cut -d: -f3 "$LAST_STATE" 2>/dev/null)
-  [ -z "$_cc_base" ] && _cc_base="${_cc_prev_cost:-$_cc_now}"
-  _cc_delta=$(awk -v a="$_cc_now" -v b="$_cc_base" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.6f", d}')
-  compact_count=$((compact_count + 1))
-  compact_total=$(awk -v a="$compact_total" -v b="$_cc_delta" 'BEGIN{printf "%.6f", a+b}')
-  # Advance the turn baseline (LAST_STATE col 3) to the post-compaction cost so a *subsequent*
-  # compaction with no real turn in between measures only its own incremental cost, not this
-  # one's again. Preserve cols 1-2 (tok_out, ts) so turn detection and the TTL base are intact.
-  if [ -f "$LAST_STATE" ]; then
-    _ls1=$(cut -d: -f1 "$LAST_STATE" 2>/dev/null); _ls2=$(cut -d: -f2 "$LAST_STATE" 2>/dev/null)
-    echo "${_ls1:-0}:${_ls2:-$now}:${_cc_now}" > "${LAST_STATE}.tmp" && mv "${LAST_STATE}.tmp" "$LAST_STATE"
+# Hook mode only: the capture needs the harness total, which the transcript never carries
+# (CC 2.1.290). Transcript mode would count every compaction at $0 and print a bogus row.
+if [ "$mode" = stdin ]; then
+  if [ -f "$COMPACT_STATE" ]; then
+    read -r compact_count compact_total _cc_prev_cost _cc_prev_floor < "$COMPACT_STATE"
   fi
+  compact_count="${compact_count:-0}"; compact_total="${compact_total:-0}"
+  # Only count once we have a prior baseline (don't retroactively price compacts that
+  # predate this feature — their deltas were never captured). A non-zero floor change
+  # since the last render means a new compaction just completed.
+  if [ -n "$_cc_prev_floor" ] && [ "$_cc_floor" != "$_cc_prev_floor" ] && [ "$_cc_floor" != "0" ]; then
+    # Baseline = cost at the last completed turn, not the previous render. A long compaction
+    # (seconds to minutes) makes the harness bump total_cost_usd a render or two BEFORE the
+    # compact_boundary line lands in the transcript, so the previous render already shows the
+    # higher cost and a render-to-render delta collapses to 0. The last *turn* cost is a stable
+    # pre-compact anchor — nothing meaningful bills between a turn and a compaction except the
+    # compaction itself (plus negligible internal Haiku). LAST_STATE col 3 holds it; fall back
+    # to the previous render's cost for pre-upgrade sessions that haven't rewritten LAST_STATE.
+    _cc_base=$(cut -d: -f3 "$LAST_STATE" 2>/dev/null)
+    [ -z "$_cc_base" ] && _cc_base="${_cc_prev_cost:-$_cc_now}"
+    _cc_delta=$(awk -v a="$_cc_now" -v b="$_cc_base" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.6f", d}')
+    compact_count=$((compact_count + 1))
+    compact_total=$(awk -v a="$compact_total" -v b="$_cc_delta" 'BEGIN{printf "%.6f", a+b}')
+    # Advance the turn baseline (LAST_STATE col 3) to the post-compaction cost so a *subsequent*
+    # compaction with no real turn in between measures only its own incremental cost, not this
+    # one's again. Preserve cols 1-2 (tok_out, ts) so turn detection and the TTL base are intact.
+    if [ -f "$LAST_STATE" ]; then
+      _ls1=$(cut -d: -f1 "$LAST_STATE" 2>/dev/null); _ls2=$(cut -d: -f2 "$LAST_STATE" 2>/dev/null)
+      echo "${_ls1:-0}:${_ls2:-$now}:${_cc_now}" > "${LAST_STATE}.tmp" && mv "${LAST_STATE}.tmp" "$LAST_STATE"
+    fi
+  fi
+  echo "${compact_count} ${compact_total} ${_cc_now} ${_cc_floor}" > "${COMPACT_STATE}.tmp" \
+    && mv "${COMPACT_STATE}.tmp" "$COMPACT_STATE"
 fi
-echo "${compact_count} ${compact_total} ${_cc_now} ${_cc_floor}" > "${COMPACT_STATE}.tmp" \
-  && mv "${COMPACT_STATE}.tmp" "$COMPACT_STATE"
 
 prev_tout="-1"
 prev_ts=$now
@@ -556,7 +897,7 @@ END {
 ' "${jsonl_files[@]}" > "$_mb_tmp" 2>/dev/null \
           && touch -r "${_mb_tmp}.s" "$_mb_tmp" 2>/dev/null \
           && mv "$_mb_tmp" "$MODEL_BREAKDOWN" 2>/dev/null
-        rm -f "${_mb_tmp}.s" "$_mb_tmp" 2>/dev/null ) &
+        rm -f "${_mb_tmp}.s" "$_mb_tmp" 2>/dev/null ) >/dev/null 2>&1 &
     fi
   fi
   touch "$MB_PROBE" 2>/dev/null
@@ -565,7 +906,7 @@ END {
 if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
   prev_ts=$now
   mb_regen_check
-  [ -x "${HOME}/.claude/refresh-pricing.sh" ] && "${HOME}/.claude/refresh-pricing.sh" &
+  [ -x "${HOME}/.claude/refresh-pricing.sh" ] && "${HOME}/.claude/refresh-pricing.sh" >/dev/null 2>&1 &
 
   # Snapshot per-model display values at the time of this turn.
   # Written as cols 5-7 in cache_log so the per-model read below returns the
@@ -646,7 +987,7 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
             _inh_ts=$_ts; _inh5=$_5; _inh1=$_1
           fi ;;
       esac
-    done < "${STATE_DIR}/cache_log.txt" 2>/dev/null
+    done < "${TURN_DIR}/cache_log.txt" 2>/dev/null
     # Whiff inheritance: 0/0 extraction means either the family grep found no fresh
     # line (flush race, first turn after a model switch) or the turn wrote nothing new
     # (pure cache-hit turn). Either way the previous cache still exists and reads
@@ -656,8 +997,8 @@ if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
       turn_cw5m=$_inh5; turn_cw1h=$_inh1
     fi
     echo "${now} ${turn_cw5m} ${turn_cw1h} ${_cache_filter} ${cached_now} ${turn_ctx_pct} ${turn_ctx_kb}"
-  } > "${STATE_DIR}/cache_log.txt.tmp" 2>/dev/null && \
-    mv "${STATE_DIR}/cache_log.txt.tmp" "${STATE_DIR}/cache_log.txt" 2>/dev/null
+  } > "${TURN_DIR}/cache_log.txt.tmp" 2>/dev/null && \
+    mv "${TURN_DIR}/cache_log.txt.tmp" "${TURN_DIR}/cache_log.txt" 2>/dev/null
 
   # Commit the turn marker LAST — and atomically. The marker is what closes this gate
   # (tok_out == prev_tout on the next render), so it must land only after cache_log is
@@ -690,7 +1031,7 @@ fi
 # Used for (a) per-model TTL timer base and (b) which TTL tier the last write used.
 model_last_ts=0; model_last_is_1h=0; model_last_cached=0
 model_last_ctx_pct=""; model_last_ctx_kb=""
-if [ -f "${STATE_DIR}/cache_log.txt" ]; then
+if [ -f "${TURN_DIR}/cache_log.txt" ]; then
   while IFS=' ' read -r _ts _5 _1 _m _c _cp _ck; do
     # Skip entries from a different model; skip old 3-column entries (no model tag)
     [ -z "$_m" ] && continue
@@ -716,7 +1057,7 @@ if [ -f "${STATE_DIR}/cache_log.txt" ]; then
     model_last_ctx_pct=""; model_last_ctx_kb=""
     case "$_cp" in ''|*[!0-9]*) ;; *) [ "$_cp" -le 100 ]    && model_last_ctx_pct=$_cp ;; esac
     case "$_ck" in ''|*[!0-9]*) ;; *) [ "$_ck" -le 100000 ] && model_last_ctx_kb=$_ck ;; esac
-  done < "${STATE_DIR}/cache_log.txt"
+  done < "${TURN_DIR}/cache_log.txt"
 fi
 
 # Per-model ctx override: use cache_log stored ctx values so switching models in
