@@ -18,12 +18,14 @@ usage: statusline.sh                        hook mode: session JSON on stdin (st
        statusline.sh --transcript <path> [opts]
 options:
   --tmux        emit tmux #[...] styles instead of ANSI escapes
-  --line N      print one row: 1 = turn line, 2 / 3 = the first / second per-model Σ row,
-                4 = the third Σ row plus any further ones joined with " │ " (tmux caps the
-                status bar at 5 rows). The Σ /compact row needs the hook's cost and is never
-                shown in transcript mode, so no --line selects it.
-  --socket P    with --line 1: resize the tmux server at socket P (#{socket_path}) to
-                2 + min(Σ rows, 3) status rows, only when that count changes
+  --line N      print the tmux status row N (0-4): the turn line when N is the turn row,
+                else per-model Σ row N - turn row; row 4, the last one tmux allows, also
+                takes every further Σ row joined with " │ ". The Σ /compact row needs the
+                hook's cost and is never shown in transcript mode.
+  --turn-row T  the row holding the turn line: 1 (default; row 0 keeps tmux's window list,
+                3 Σ rows fit) or 0 (no window list, 4 Σ rows fit). --line 0 implies 0.
+  --socket P    on the turn row's render: resize the tmux server at socket P
+                (#{socket_path}) to fit the Σ rows, only when that count changes
   --help        this text
 Transcript mode prints nothing when no session is found. env: CLAUDE_STATUSLINE_CTX_SIZE
 (context window for ids without [1m]; default: 1M for 5.x+ models, 200k for older),
@@ -32,7 +34,7 @@ EOF
 }
 _dbg() { [ "${CLAUDE_STATUSLINE_DEBUG:-}" = 1 ] && echo "statusline: $*" >&2; return 0; }
 
-mode=stdin; opt_pane=""; opt_session=""; opt_transcript=""; opt_tmux=0; opt_line=""; opt_socket=""
+mode=stdin; opt_pane=""; opt_session=""; opt_transcript=""; opt_tmux=0; opt_line=""; opt_socket=""; opt_turn=""
 # Any flag selects transcript mode, and stdin is never read there: tmux #() gives the command
 # no input, so a cat would only block or read garbage.
 if [ $# -gt 0 ]; then
@@ -41,7 +43,7 @@ if [ $# -gt 0 ]; then
     case "$1" in
       --help|-h) _usage; exit 0 ;;
       --tmux)    opt_tmux=1; shift; continue ;;
-      --pane|--session|--transcript|--line|--socket)
+      --pane|--session|--transcript|--line|--socket|--turn-row)
         [ $# -ge 2 ] || { _usage >&2; exit 2; }   # bash 3.2 shift 2 with one arg left is a no-op
         case "$1" in
           --pane)       opt_pane="$2" ;;
@@ -49,13 +51,18 @@ if [ $# -gt 0 ]; then
           --transcript) opt_transcript="$2" ;;
           --line)       opt_line="$2" ;;
           --socket)     opt_socket="$2" ;;
+          --turn-row)   opt_turn="$2" ;;
         esac
         shift 2 ;;
       *) _usage >&2; exit 2 ;;
     esac
   done
   case "$opt_pane" in *[!0-9]*) _usage >&2; exit 2 ;; esac
-  case "$opt_line" in ''|1|2|3|4) ;; *) _usage >&2; exit 2 ;; esac
+  case "$opt_line" in ''|0|1|2|3|4) ;; *) _usage >&2; exit 2 ;; esac
+  [ -z "$opt_turn" ] && { [ "$opt_line" = 0 ] && opt_turn=0 || opt_turn=1; }
+  case "$opt_turn" in 0|1) ;; *) _usage >&2; exit 2 ;; esac
+  # A row above the turn line is tmux's window list, not ours.
+  [ -n "$opt_line" ] && [ "$opt_line" -lt "$opt_turn" ] && { _usage >&2; exit 2; }
   [ -n "$opt_pane$opt_session$opt_transcript" ] || { _usage >&2; exit 2; }
 else
   input=$(cat)
@@ -151,15 +158,17 @@ _resolve_pane() {
   return 1
 }
 
-# tmux status rows: 1 window list + 1 turn line + one per Σ row, capped at tmux's 5. Run by
-# the --line 1 render only, and only when the wanted count differs from the last one this
-# script set on that server: a `set` per render would redraw the bar every status-interval.
+# tmux status rows: rows 0..turn row, then one per Σ row, up to row 4 (tmux hard-codes 5
+# rows). Run by the turn row's render only, and only when the wanted value differs from the
+# last one this script set on that server: a `set` per render would redraw the bar every
+# status-interval. tmux takes "on" for one row; "1" is rejected (tmux 3.4).
 # Keyed per tmux socket, not per session: switching to a pane whose session has another
 # model count must resize even though neither session's count changed.
 _resize() {
   local rows="${1:-0}" want last="" f
-  [ "$rows" -gt 3 ] && rows=3
-  want=$((2 + rows))
+  [ "$rows" -gt $((4 - opt_turn)) ] && rows=$((4 - opt_turn))
+  want=$((opt_turn + 1 + rows))
+  [ "$want" = 1 ] && want=on
   f="/tmp/claude_statusline_status_${opt_socket//[!A-Za-z0-9]/_}.txt"
   [ -f "$f" ] && read -r last < "$f"
   [ "$last" = "$want" ] && return 0
@@ -168,7 +177,7 @@ _resize() {
 }
 # Nothing to render: a pane without Claude Code shrinks the bar to the empty turn row.
 _none() {
-  [ "$opt_line" = 1 ] && [ -n "$opt_socket" ] && _resize 0
+  [ "$opt_line" = "$opt_turn" ] && [ -n "$opt_socket" ] && _resize 0
   exit 0
 }
 
@@ -199,14 +208,16 @@ if [ "$mode" = transcript ]; then
   # parsed for #[...] but raw escapes are not interpreted. "#" in content is doubled first.
   _post() {
     local cf="" n=""
-    [ "$opt_line" = 1 ] && [ -n "$opt_socket" ] && cf="/tmp/claude_statusline_rows.$$.$RANDOM"
-    awk -v want="$opt_line" -v sep="${DIM} │ ${RESET}" -v cmark="Σ ${CYAN}/compact" -v cf="$cf" '
-      NR == 1          { if (want == "" || want == 1) print; next }
+    [ "$opt_line" = "$opt_turn" ] && [ -n "$opt_socket" ] && cf="/tmp/claude_statusline_rows.$$.$RANDOM"
+    # Σ row k = line - turn row; row 4 is tmux's last and folds every later Σ row into itself.
+    awk -v want="$opt_line" -v turn="$opt_turn" -v sep="${DIM} │ ${RESET}" \
+        -v cmark="Σ ${CYAN}/compact" -v cf="$cf" '
+      NR == 1          { if (want == "" || want == turn) print; next }
       index($0, cmark) { if (want == "") print; next }
-      { n++
+      { n++; k = want - turn
         if (want == "") print
-        else if (want == n + 1 && n < 3) print
-        else if (want == 4 && n >= 3) l4 = (l4 == "" ? $0 : l4 sep $0) }
+        else if (want < 4 && n == k) print
+        else if (want == 4 && n >= k) l4 = (l4 == "" ? $0 : l4 sep $0) }
       END { if (l4 != "") print l4; if (cf != "") print n + 0 > cf }'
     if [ -n "$cf" ]; then
       read -r n 2>/dev/null < "$cf"; rm -f "$cf"

@@ -1135,7 +1135,7 @@ echo "--- Test 58: flags — usage, bad input exits 2, any flag skips stdin"
 out58=$(bash "$SCRIPT" --help 2>&1); rc=$?
 assert_eq "--help exits 0" "0" "$rc"
 assert_contains "--help prints usage" "statusline.sh --pane <pid>" "$out58"
-for _a in "--bogus" "--pane" "--pane 12x" "--line 5 --pane 1" "--tmux" "--line 1"; do
+for _a in "--bogus" "--pane" "--pane 12x" "--line 5 --pane 1" "--line 0 --turn-row 1 --pane 1" "--turn-row 2 --pane 1" "--tmux" "--line 1"; do
   bash "$SCRIPT" $_a </dev/null >/dev/null 2>&1; rc=$?
   assert_eq "'$_a' exits 2" "2" "$rc"
 done
@@ -1332,12 +1332,47 @@ assert_eq "unchanged count → no second set" "1" "$(wc -l < "$SH66/calls" | tr 
 : "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --line 2)"
 : "$(PATH="$SH66:$PATH" _tm --session "$SID66" --line 1)"
 assert_eq "no resize from --line 2, or without --socket" "1" "$(wc -l < "$SH66/calls" | tr -d ' ')"
-printf '%s\n' "claude-opus-5-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" > "$SD66/model_breakdown.txt"; touch "$SD66/model_breakdown.txt"
+printf '%s\n' "claude-opus-5-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" > "$SD66/model_breakdown.txt"
+touch -t 203001010000 "$SD66/model_breakdown.txt"   # new mtime second: the Σ render cache keys on it
 : "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --line 1)"
 assert_eq "1 row → status 3" "-S $SOCK66 set -g status 3" "$(tail -1 "$SH66/calls")"
 : "$(PATH="$SH66:$PATH" _tm --pane 999999 --socket "$SOCK66" --line 1)"
 assert_eq "no session under the pane → status 2" "-S $SOCK66 set -g status 2" "$(tail -1 "$SH66/calls")"
 rm -rf "$SH66" "$SD66" /tmp/claude_statusline_status_*sltest_sock_$$* /tmp/claude_statusline_pane_999999.txt
+
+echo "--- Test 67: no-window-list layout — turn line on row 0, four Σ rows, resize to 1+min(rows,4)"
+# Same row math, turn row 0: --line 0 = turn line, --turn-row 0 --line k = Σ row k, row 4
+# folds the fifth model in. tmux rejects status 1, so one row is "on".
+SID67="test-tm67-$$"; J67="$CD60/projects/-tmp-x/$SID67.jsonl"; SD67="/tmp/claude_session_$SID67"
+_al claude-opus-5-5 "$U2" '' > "$J67"; touch -t 202001010000 "$J67"
+mkdir -p "$SD67/transcript"; echo "7:$(date +%s):0" > "$SD67/transcript/last_api.ts"
+for _m in claude-opus-5-5 claude-sonnet-5 claude-fable-5-1 claude-haiku-4-5 claude-opus-4-7; do
+  echo "$_m 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0"; done > "$SD67/model_breakdown.txt"
+_tm --session "$SID67" >/dev/null   # warm-up: the first render writes the local cost after its top line
+full67=$(_tm --session "$SID67" | strip_ansi)
+_nottl() { strip_ansi | sed 's/~ttl.*//'; }
+_r() { printf '%s\n' "$full67" | sed -n "$1p"; }
+assert_eq "--line 0 = the turn line" "$(_r 1 | _nottl)" "$(_tm --session "$SID67" --line 0 | _nottl)"
+for _k in 1 2 3; do
+  assert_eq "--turn-row 0 --line $_k = Σ row $_k" "$(_r $((_k + 1)))" "$(_tm --session "$SID67" --turn-row 0 --line $_k | strip_ansi)"
+done
+assert_eq "--turn-row 0 --line 4 = Σ rows 4 and 5 joined" "$(_r 5) │ $(_r 6)" \
+  "$(_tm --session "$SID67" --turn-row 0 --line 4 | strip_ansi)"
+assert_eq "default turn row 1 unchanged: --line 1 = turn line" "$(_r 1 | _nottl)" "$(_tm --session "$SID67" --line 1 | _nottl)"
+SH67="/tmp/sltest-tmuxshim67-$$"; mkdir -p "$SH67"; SOCK67="/tmp/sltest-sock67-$$"
+printf '#!/bin/sh\necho "$*" >> %s/calls\n' "$SH67" > "$SH67/tmux"; chmod +x "$SH67/tmux"
+: "$(PATH="$SH67:$PATH" _tm --session "$SID67" --socket "$SOCK67" --tmux --line 0)"
+assert_eq "5 Σ rows → status 5 (1 + min(5, 4))" "-S $SOCK67 set -g status 5" "$(cat "$SH67/calls" 2>/dev/null)"
+: "$(PATH="$SH67:$PATH" _tm --session "$SID67" --socket "$SOCK67" --tmux --line 0)"
+: "$(PATH="$SH67:$PATH" _tm --session "$SID67" --socket "$SOCK67" --turn-row 0 --line 1)"
+assert_eq "unchanged, and Σ rows never resize" "1" "$(wc -l < "$SH67/calls" | tr -d ' ')"
+printf '%s\n' "claude-opus-5-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" "claude-sonnet-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" > "$SD67/model_breakdown.txt"
+touch -t 203001010000 "$SD67/model_breakdown.txt"   # new mtime second: the Σ render cache keys on it
+: "$(PATH="$SH67:$PATH" _tm --session "$SID67" --socket "$SOCK67" --line 0)"
+assert_eq "2 Σ rows → status 3" "-S $SOCK67 set -g status 3" "$(tail -1 "$SH67/calls")"
+: "$(PATH="$SH67:$PATH" _tm --pane 999999 --socket "$SOCK67" --line 0)"
+assert_eq "no session → one row, as 'on' (tmux rejects 1)" "-S $SOCK67 set -g status on" "$(tail -1 "$SH67/calls")"
+rm -rf "$SH67" "$SD67" /tmp/claude_statusline_status_*sltest_sock67_$$* /tmp/claude_statusline_pane_999999.txt
 
 echo "--- Test 65: install.sh --tmux leaves settings.json byte-identical, uninstall too"
 # On a managed machine the user statusLine is dropped anyway; --tmux installs the scripts and
@@ -1350,7 +1385,8 @@ out65=$(HOME="$H65" bash "$ROOT/install.sh" --tmux 2>&1); rc=$?
 assert_eq       "--tmux install exits 0"                "0" "$rc"
 assert_eq       "settings.json untouched by install"    "$_s65" "$(cat "$H65/.claude/settings.json")"
 assert_eq       "statusline.sh installed"               "yes" "$([ -x "$H65/.claude/statusline.sh" ] && echo yes)"
-assert_contains "prints the status-format snippet"      "status-format[1] '#($H65/.claude/statusline.sh --pane #{pane_pid} --socket #{socket_path} --tmux --line 1)'" "$out65"
+assert_contains "prints the recommended snippet"       "status-format[0] '#($H65/.claude/statusline.sh --pane #{pane_pid} --socket #{socket_path} --tmux --line 0)'" "$out65"
+assert_contains "Σ rows know the turn row"             "status-format[4] '#($H65/.claude/statusline.sh --pane #{pane_pid} --turn-row 0 --tmux --line 4)'" "$out65"
 assert_contains "terminal-background status style"     "set -g status-style bg=default" "$out65"
 assert_contains "names the context-size knob"           "CLAUDE_STATUSLINE_CTX_SIZE" "$out65"
 HOME="$H65" bash "$ROOT/uninstall.sh" >/dev/null 2>&1 </dev/null

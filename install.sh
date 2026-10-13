@@ -145,14 +145,17 @@ if [ "$TMUX_MODE" = 1 ]; then
   cat <<EOF
 
 Done. Add this to ~/.tmux.conf (tmux 2.9+), then: tmux source-file ~/.tmux.conf
-  set -g status 2
+  set -g status on
   set -g status-interval 2
   set -g status-style bg=default
-  set -g status-format[1] '#($CMD_PATH --pane #{pane_pid} --socket #{socket_path} --tmux --line 1)'
-  set -g status-format[2] '#($CMD_PATH --pane #{pane_pid} --tmux --line 2)'
-  set -g status-format[3] '#($CMD_PATH --pane #{pane_pid} --tmux --line 3)'
-  set -g status-format[4] '#($CMD_PATH --pane #{pane_pid} --tmux --line 4)'
-The bar grows from 2 to 5 rows as models appear (--socket lets the turn row resize it).
+  set -g status-format[0] '#($CMD_PATH --pane #{pane_pid} --socket #{socket_path} --tmux --line 0)'
+  set -g status-format[1] '#($CMD_PATH --pane #{pane_pid} --turn-row 0 --tmux --line 1)'
+  set -g status-format[2] '#($CMD_PATH --pane #{pane_pid} --turn-row 0 --tmux --line 2)'
+  set -g status-format[3] '#($CMD_PATH --pane #{pane_pid} --turn-row 0 --tmux --line 3)'
+  set -g status-format[4] '#($CMD_PATH --pane #{pane_pid} --turn-row 0 --tmux --line 4)'
+Row 0 shows the turn line instead of tmux's window list, and rows 1-4 show up to four
+models. The bar grows as models appear (--socket lets the turn row resize it; tmux allows
+5 rows at most). The README has the layout that keeps the window list.
 Context window: 1M is assumed for 5.x models. If your gateway serves less, prefix the
 command: '#(CLAUDE_STATUSLINE_CTX_SIZE=200000 $CMD_PATH --pane ...)'.
 EOF
