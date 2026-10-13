@@ -18,8 +18,12 @@ usage: statusline.sh                        hook mode: session JSON on stdin (st
        statusline.sh --transcript <path> [opts]
 options:
   --tmux        emit tmux #[...] styles instead of ANSI escapes
-  --line N      print one line group: 1 = turn line, 2 = per-model Σ rows on one line,
-                3 = Σ /compact row (always empty in transcript mode: it needs the hook's cost)
+  --line N      print one row: 1 = turn line, 2 / 3 = the first / second per-model Σ row,
+                4 = the third Σ row plus any further ones joined with " │ " (tmux caps the
+                status bar at 5 rows). The Σ /compact row needs the hook's cost and is never
+                shown in transcript mode, so no --line selects it.
+  --socket P    with --line 1: resize the tmux server at socket P (#{socket_path}) to
+                2 + min(Σ rows, 3) status rows, only when that count changes
   --help        this text
 Transcript mode prints nothing when no session is found. env: CLAUDE_STATUSLINE_CTX_SIZE
 (context window for ids without [1m]; default: 1M for 5.x+ models, 200k for older),
@@ -28,7 +32,7 @@ EOF
 }
 _dbg() { [ "${CLAUDE_STATUSLINE_DEBUG:-}" = 1 ] && echo "statusline: $*" >&2; return 0; }
 
-mode=stdin; opt_pane=""; opt_session=""; opt_transcript=""; opt_tmux=0; opt_line=""
+mode=stdin; opt_pane=""; opt_session=""; opt_transcript=""; opt_tmux=0; opt_line=""; opt_socket=""
 # Any flag selects transcript mode, and stdin is never read there: tmux #() gives the command
 # no input, so a cat would only block or read garbage.
 if [ $# -gt 0 ]; then
@@ -37,20 +41,21 @@ if [ $# -gt 0 ]; then
     case "$1" in
       --help|-h) _usage; exit 0 ;;
       --tmux)    opt_tmux=1; shift; continue ;;
-      --pane|--session|--transcript|--line)
+      --pane|--session|--transcript|--line|--socket)
         [ $# -ge 2 ] || { _usage >&2; exit 2; }   # bash 3.2 shift 2 with one arg left is a no-op
         case "$1" in
           --pane)       opt_pane="$2" ;;
           --session)    opt_session="$2" ;;
           --transcript) opt_transcript="$2" ;;
           --line)       opt_line="$2" ;;
+          --socket)     opt_socket="$2" ;;
         esac
         shift 2 ;;
       *) _usage >&2; exit 2 ;;
     esac
   done
   case "$opt_pane" in *[!0-9]*) _usage >&2; exit 2 ;; esac
-  case "$opt_line" in ''|1|2|3) ;; *) _usage >&2; exit 2 ;; esac
+  case "$opt_line" in ''|1|2|3|4) ;; *) _usage >&2; exit 2 ;; esac
   [ -n "$opt_pane$opt_session$opt_transcript" ] || { _usage >&2; exit 2; }
 else
   input=$(cat)
@@ -146,13 +151,34 @@ _resolve_pane() {
   return 1
 }
 
+# tmux status rows: 1 window list + 1 turn line + one per Σ row, capped at tmux's 5. Run by
+# the --line 1 render only, and only when the wanted count differs from the last one this
+# script set on that server: a `set` per render would redraw the bar every status-interval.
+# Keyed per tmux socket, not per session: switching to a pane whose session has another
+# model count must resize even though neither session's count changed.
+_resize() {
+  local rows="${1:-0}" want last="" f
+  [ "$rows" -gt 3 ] && rows=3
+  want=$((2 + rows))
+  f="/tmp/claude_statusline_status_${opt_socket//[!A-Za-z0-9]/_}.txt"
+  [ -f "$f" ] && read -r last < "$f"
+  [ "$last" = "$want" ] && return 0
+  tmux -S "$opt_socket" set -g status "$want" >/dev/null 2>&1 && echo "$want" > "$f" 2>/dev/null
+  return 0
+}
+# Nothing to render: a pane without Claude Code shrinks the bar to the empty turn row.
+_none() {
+  [ "$opt_line" = 1 ] && [ -n "$opt_socket" ] && _resize 0
+  exit 0
+}
+
 if [ "$mode" = transcript ]; then
   session_id=""; transcript_path=""
   if [ -n "$opt_transcript" ]; then
     transcript_path="$opt_transcript"; session_id=$(basename "$opt_transcript" .jsonl)
   elif [ -n "$opt_session" ]; then
     session_id="$opt_session"
-    case "$session_id" in *[!A-Za-z0-9_.-]*|.*) _dbg "bad session id '$session_id'"; exit 0 ;; esac
+    case "$session_id" in *[!A-Za-z0-9_.-]*|.*) _dbg "bad session id '$session_id'"; _none ;; esac
     _tp_cache="/tmp/claude_session_${session_id}/transcript_path.txt"
     transcript_path=$(cat "$_tp_cache" 2>/dev/null)
     if [ ! -f "$transcript_path" ]; then
@@ -161,23 +187,31 @@ if [ "$mode" = transcript ]; then
         && echo "$transcript_path" > "$_tp_cache" 2>/dev/null
     fi
   else
-    _resolve_pane "$opt_pane" || exit 0
+    _resolve_pane "$opt_pane" || _none
   fi
   # session_id names a /tmp state dir: anything but a plain id is refused, not sanitized.
-  case "$session_id" in ''|*[!A-Za-z0-9_.-]*|.*) _dbg "bad session id '$session_id'"; exit 0 ;; esac
-  [ -f "$transcript_path" ] || { _dbg "no transcript for session $session_id"; exit 0; }
+  case "$session_id" in ''|*[!A-Za-z0-9_.-]*|.*) _dbg "bad session id '$session_id'"; _none ;; esac
+  [ -f "$transcript_path" ] || { _dbg "no transcript for session $session_id"; _none; }
 
-  # Output filter, attached before anything is printed. --line picks one line group (tmux
-  # #() keeps only the first line of a command's output, so each status-format row asks for
-  # its own); --tmux maps the SGR codes this script emits to tmux styles: #() output is
+  # Output filter, attached before anything is printed. --line picks one row (tmux #() keeps
+  # only the first line of a command's output, so each status-format row asks for its own);
+  # the /compact row is dropped from every selection (it is never rendered here); --tmux maps the SGR codes this script emits to tmux styles: #() output is
   # parsed for #[...] but raw escapes are not interpreted. "#" in content is doubled first.
   _post() {
-    awk -v want="$opt_line" -v sep="${DIM} │ ${RESET}" -v cmark="Σ ${CYAN}/compact" '
-      want == ""          { print; next }
-      NR == 1             { if (want == 1) print; next }
-      index($0, cmark)    { if (want == 3) print; next }
-      want == 2           { l2 = (l2 == "" ? $0 : l2 sep $0) }
-      END                 { if (want == 2 && l2 != "") print l2 }'
+    local cf="" n=""
+    [ "$opt_line" = 1 ] && [ -n "$opt_socket" ] && cf="/tmp/claude_statusline_rows.$$.$RANDOM"
+    awk -v want="$opt_line" -v sep="${DIM} │ ${RESET}" -v cmark="Σ ${CYAN}/compact" -v cf="$cf" '
+      NR == 1          { if (want == "" || want == 1) print; next }
+      index($0, cmark) { if (want == "") print; next }
+      { n++
+        if (want == "") print
+        else if (want == n + 1 && n < 3) print
+        else if (want == 4 && n >= 3) l4 = (l4 == "" ? $0 : l4 sep $0) }
+      END { if (l4 != "") print l4; if (cf != "") print n + 0 > cf }'
+    if [ -n "$cf" ]; then
+      read -r n 2>/dev/null < "$cf"; rm -f "$cf"
+      _resize "${n:-0}"
+    fi
   }
   _tmux_fmt() {
     local e=$'\033'

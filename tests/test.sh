@@ -1135,7 +1135,7 @@ echo "--- Test 58: flags — usage, bad input exits 2, any flag skips stdin"
 out58=$(bash "$SCRIPT" --help 2>&1); rc=$?
 assert_eq "--help exits 0" "0" "$rc"
 assert_contains "--help prints usage" "statusline.sh --pane <pid>" "$out58"
-for _a in "--bogus" "--pane" "--pane 12x" "--line 4 --pane 1" "--tmux" "--line 1"; do
+for _a in "--bogus" "--pane" "--pane 12x" "--line 5 --pane 1" "--tmux" "--line 1"; do
   bash "$SCRIPT" $_a </dev/null >/dev/null 2>&1; rc=$?
   assert_eq "'$_a' exits 2" "2" "$rc"
 done
@@ -1279,11 +1279,13 @@ assert_contains "--line 1: the turn line" "Opus 5.5 │ ctx" "$out63"
 assert_eq "one dollar value on the turn line (local sum, no harness)" "1" \
   "$(printf '%s' "$out63" | grep -o '\$[0-9.]*' | wc -l | tr -d ' ')"
 assert_not_contains "no 'harness / local' pair" " / \$" "$out63"
-out63=$(_tm --session "$SID60" --line 2 | strip_ansi)
-assert_eq "--line 2: one line" "1" "$(printf '%s\n' "$out63" | wc -l | tr -d ' ')"
-assert_eq "--line 2: 3 Σ rows joined by ' │ '" "2" "$(printf '%s' "$out63" | grep -o ' │ Σ ' | wc -l | tr -d ' ')"
-assert_contains "--line 2: attribution suffix kept" "(main \$4.28 · agents ×1 \$0.208)" "$out63"
-assert_eq "--line 3: empty in transcript mode" "" "$(_tm --session "$SID60" --line 3)"
+# One Σ row per tmux row: --line 2/3 = first/second model, 4 = third (+ overflow, Test 66)
+full63=$(_tm --session "$SID60" | strip_ansi)
+assert_contains "Σ attribution suffix kept" "(main \$4.28 · agents ×1 \$0.208)" "$full63"
+for _n in 2 3 4; do
+  assert_eq "--line $_n = Σ row $((_n - 1))" "$(printf '%s\n' "$full63" | sed -n "${_n}p")" \
+    "$(_tm --session "$SID60" --line $_n | strip_ansi)"
+done
 
 echo "--- Test 64: /compact row and baseline suppressed in transcript mode"
 # Two compactions: the hook would price each from total_cost_usd; transcript mode has none and
@@ -1305,6 +1307,38 @@ assert_eq "turn state kept apart from the hook's" "yes:no" \
   "$([ -f /tmp/claude_session_$SID64/transcript/last_api.ts ] && echo yes || echo no):$([ -f /tmp/claude_session_$SID64/last_api.ts ] && echo yes || echo no)"
 rm -rf "/tmp/claude_session_$SID60" "/tmp/claude_session_$SID64"
 
+echo "--- Test 66: stacked Σ rows — overflow fold and the tmux resize via --socket"
+# 4 models: rows 2/3 one model each, row 4 the third and fourth joined. The --line 1 render
+# with --socket sets tmux status to 2 + min(rows, 3) once per change (PATH shim logs tmux).
+# The resize runs in the output filter after the render; $(...) waits for it like tmux #()
+# does (both read to EOF), a >/dev/null caller would not.
+SID66="test-tm66-$$"; J66="$CD60/projects/-tmp-x/$SID66.jsonl"; SD66="/tmp/claude_session_$SID66"
+_al claude-opus-5-5 "$U2" '' > "$J66"; touch -t 202001010000 "$J66"
+mkdir -p "$SD66"; echo "7:$(date +%s):0" > "$SD66/last_api.ts"; mkdir -p "$SD66/transcript"; cp "$SD66/last_api.ts" "$SD66/transcript/"
+printf '%s\n' "claude-opus-5-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" "claude-sonnet-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" \
+  "claude-fable-5-1 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" "claude-haiku-4-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" > "$SD66/model_breakdown.txt"
+full66=$(_tm --session "$SID66" | strip_ansi)
+assert_eq "4 Σ rows in the full render" "4" "$(printf '%s\n' "$full66" | grep -c '^Σ ')"
+r3=$(printf '%s\n' "$full66" | sed -n 4p); r4=$(printf '%s\n' "$full66" | sed -n 5p)
+assert_eq "--line 4 = Σ rows 3 and 4 joined" "$r3 │ $r4" "$(_tm --session "$SID66" --line 4 | strip_ansi)"
+assert_eq "--line 3 = Σ row 2 alone" "$(printf '%s\n' "$full66" | sed -n 3p)" "$(_tm --session "$SID66" --line 3 | strip_ansi)"
+SH66="/tmp/sltest-tmuxshim-$$"; mkdir -p "$SH66"; SOCK66="/tmp/sltest-sock-$$"
+printf '#!/bin/sh\necho "$*" >> %s/calls\n' "$SH66" > "$SH66/tmux"; chmod +x "$SH66/tmux"
+rm -f /tmp/claude_statusline_status_*sltest_sock_$$*
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --tmux --line 1)"
+assert_eq "4 rows → status 5 (capped), once" "-S $SOCK66 set -g status 5" "$(cat "$SH66/calls" 2>/dev/null)"
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --tmux --line 1)"
+assert_eq "unchanged count → no second set" "1" "$(wc -l < "$SH66/calls" | tr -d ' ')"
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --line 2)"
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --line 1)"
+assert_eq "no resize from --line 2, or without --socket" "1" "$(wc -l < "$SH66/calls" | tr -d ' ')"
+printf '%s\n' "claude-opus-5-5 1 1000 0 0 10 0 0 0 0 0 0 0 0 0 0" > "$SD66/model_breakdown.txt"; touch "$SD66/model_breakdown.txt"
+: "$(PATH="$SH66:$PATH" _tm --session "$SID66" --socket "$SOCK66" --line 1)"
+assert_eq "1 row → status 3" "-S $SOCK66 set -g status 3" "$(tail -1 "$SH66/calls")"
+: "$(PATH="$SH66:$PATH" _tm --pane 999999 --socket "$SOCK66" --line 1)"
+assert_eq "no session under the pane → status 2" "-S $SOCK66 set -g status 2" "$(tail -1 "$SH66/calls")"
+rm -rf "$SH66" "$SD66" /tmp/claude_statusline_status_*sltest_sock_$$* /tmp/claude_statusline_pane_999999.txt
+
 echo "--- Test 65: install.sh --tmux leaves settings.json byte-identical, uninstall too"
 # On a managed machine the user statusLine is dropped anyway; --tmux installs the scripts and
 # prints the tmux snippet. uninstall must not then "remove the key it added": it added none.
@@ -1316,7 +1350,8 @@ out65=$(HOME="$H65" bash "$ROOT/install.sh" --tmux 2>&1); rc=$?
 assert_eq       "--tmux install exits 0"                "0" "$rc"
 assert_eq       "settings.json untouched by install"    "$_s65" "$(cat "$H65/.claude/settings.json")"
 assert_eq       "statusline.sh installed"               "yes" "$([ -x "$H65/.claude/statusline.sh" ] && echo yes)"
-assert_contains "prints the status-format snippet"      "status-format[1] '#($H65/.claude/statusline.sh --pane #{pane_pid} --tmux --line 1)'" "$out65"
+assert_contains "prints the status-format snippet"      "status-format[1] '#($H65/.claude/statusline.sh --pane #{pane_pid} --socket #{socket_path} --tmux --line 1)'" "$out65"
+assert_contains "terminal-background status style"     "set -g status-style bg=default" "$out65"
 assert_contains "names the context-size knob"           "CLAUDE_STATUSLINE_CTX_SIZE" "$out65"
 HOME="$H65" bash "$ROOT/uninstall.sh" >/dev/null 2>&1 </dev/null
 assert_eq       "settings.json untouched by uninstall"  "$_s65" "$(cat "$H65/.claude/settings.json")"
