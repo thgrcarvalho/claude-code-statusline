@@ -1214,6 +1214,9 @@ printf '{"pid":999999,"sessionId":"%s","cwd":"/tmp/x"}' "$SID60B" > "$CD60/sessi
 # Sleepers named "claude" (a copy of sleep): _session_of rejects pids that do not look like
 # Claude Code, so a recycled pid named in a stale sessions file is not taken for a session.
 BIN60="/tmp/sltest-bin-$$"; mkdir -p "$BIN60"; cp "$(command -v sleep)" "$BIN60/claude"
+# A multicall coreutils (Ubuntu's rust coreutils) refuses to run under another name
+# ("unknown program 'claude'"): use a script there. Linux names the process after the script.
+"$BIN60/claude" 0 2>/dev/null || { printf '#!/bin/sh\nsleep "$@"\n' > "$BIN60/claude"; chmod +x "$BIN60/claude"; }
 "$BIN60/claude" 30 & S60A=$!
 bash -c "'$BIN60/claude' 30; :" & S60P=$!   # a shell with a "claude" below it: depth 2 under $$
 _i=0; S60B=""; while [ $_i -lt 30 ] && [ -z "$S60B" ]; do S60B=$(pgrep -P "$S60P" | head -1); [ -z "$S60B" ] && sleep 0.1; _i=$((_i+1)); done
