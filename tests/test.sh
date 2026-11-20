@@ -863,7 +863,8 @@ echo "--- Test 45: idle probe regenerates Σ during background fleets (no turn n
 # Background Workflow fleets append subagent JSONLs and bill into the harness total for
 # many minutes without a main-loop turn; regen used to fire only inside the turn gate,
 # freezing the local Σ (observed live: \$24.71 harness vs \$0.51 local). Idle renders now
-# probe at most every 45s, keyed on mb_probe.ts mtime.
+# probe at most every 45s, keyed on the epoch second stamped in mb_probe.ts (an empty file,
+# from an older script's touch, falls back to its mtime).
 T45="/tmp/sltest-idle-$$.jsonl"; SID45="test-idle-$$"; SDIR45="/tmp/claude_session_${SID45}"
 rm -rf "$SDIR45"; mkdir -p "$SDIR45"
 printf '%s\n' '{"type":"assistant","message":{"model":"claude-fable-5","role":"assistant","content":[],"usage":{"input_tokens":9,"cache_creation_input_tokens":10,"cache_read_input_tokens":11,"output_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10}}},"uuid":"t45-a"}' > "$T45"
@@ -886,10 +887,20 @@ assert_contains "fresh probe blocks the rescan" "SENTINEL-45" "$(cat "$MB45" 2>/
 SUB45="${T45%.jsonl}/subagents"
 mkdir -p "$SUB45"
 printf '%s\n' '{"type":"assistant","message":{"model":"claude-opus-4-8","role":"assistant","content":[],"usage":{"input_tokens":7,"cache_creation_input_tokens":8,"cache_read_input_tokens":9,"output_tokens":13,"cache_creation":{"ephemeral_5m_input_tokens":8,"ephemeral_1h_input_tokens":0}}},"uuid":"t45-sub"}' > "$SUB45/agent-fleet.jsonl"
-touch -t 202001010000 "$SDIR45/mb_probe.ts"
+_st45=$(cat "$SDIR45/mb_probe.ts" 2>/dev/null)
+_ok45=0   # (no case inside $(...): bash 3.2 misparses its pattern parentheses there)
+case "$_st45" in ''|*[!0-9]*) ;; *) [ $(( $(date +%s) - _st45 )) -le 10 ] && _ok45=1 ;; esac
+assert_eq "probe stamp holds the render's clock" "1" "$_ok45"
+echo 1577836800 > "$SDIR45/mb_probe.ts"   # stamped 2020-01-01: aged
 _idstdin | bash "$SCRIPT" >/dev/null 2>&1
 _i=0; while [ $_i -lt 30 ] && ! grep -q 'claude-opus-4-8' "$MB45" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
 assert_contains "aged probe re-armed regen (fleet cost folded in)" "claude-opus-4-8" "$(cat "$MB45" 2>/dev/null)"
+# (d) an empty probe file (older script's touch) is aged by its mtime
+printf '%s\n' "SENTINEL-45 1 2 3 4 5 6 7" > "$MB45"; touch -t 202001010000 "$MB45"
+: > "$SDIR45/mb_probe.ts"; touch -t 202001010000 "$SDIR45/mb_probe.ts"
+_idstdin | bash "$SCRIPT" >/dev/null 2>&1
+_i=0; while [ $_i -lt 30 ] && grep -q 'SENTINEL-45' "$MB45" 2>/dev/null; do sleep 0.1; _i=$((_i+1)); done
+assert_not_contains "empty probe file aged by mtime" "SENTINEL-45" "$(cat "$MB45" 2>/dev/null)"
 rm -rf "$SDIR45" "$T45" "${T45%.jsonl}"
 
 echo "--- Test 46: 0/0 whiff inherits the previous tier instead of flipping to 5m"
@@ -1398,6 +1409,183 @@ assert_eq       "no settings.json → none created"       "no" "$([ -e "$H65/.cl
 out65=$(HOME="$H65" bash "$ROOT/install.sh" --bogus 2>&1); rc=$?
 assert_eq       "unknown install flag exits 2"          "2" "$rc"
 rm -rf "$H65"
+
+# ─── Tick cache (idle fast path) ─────────────────────────────────────────────
+echo ""
+echo "=== Tick cache ==="
+# An idle hook render prints the previous full render's bytes with the countdown recomputed,
+# using builtins only. These tests pin the clock (CLAUDE_STATUSLINE_NOW) and compare a hit,
+# byte for byte, with a full render (CLAUDE_STATUSLINE_TICK=0) at the same second.
+TK="/tmp/sltest-tick-$$"; rm -rf "$TK"; mkdir -p "$TK"
+N70=$(date +%s)
+# _tk_r <stdin file> <out file> [env...]: one render; stderr (debug) to <out>.err
+_tk_r() { local in=$1 out=$2; shift 2
+  env CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" CLAUDE_STATUSLINE_DEBUG=1 "$@" \
+    bash "${TK_SCRIPT:-$SCRIPT}" < "$in" > "$out" 2> "$out.err"; }
+_tk_hit() { grep -q 'tick cache hit' "$1.err" 2>/dev/null; }
+# _tk_until_hit <stdin> <out> [env...]: render until one is a cache hit (the renders before it
+# are full: a turn, a regen landing, a Σ re-render, a write in the same clock tick); 0 = hit.
+_tk_until_hit() { local in=$1 out=$2 i=0; shift 2
+  while [ $i -lt 12 ]; do _tk_r "$in" "$out" "$@"; _tk_hit "$out" && return 0; sleep 0.15; i=$((i+1)); done
+  return 1; }
+_tk_sid() { grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" | head -1 | sed 's/.*"\([^"]*\)"$/\1/'; }
+
+echo "--- Test 70: every stdin fixture and corpus transcript — hit == full render, byte for byte"
+_tk_cases=""
+for f in "$FIXTURES"/stdin*.json; do _tk_cases="$_tk_cases $f"; done
+_tk_i=0
+for c in "$ROOT"/tests/corpus/*.jsonl "$FIXTURES/jsonl_attrib.jsonl" "$FIXTURES/transcript-with-compact.jsonl"; do
+  [ -f "$c" ] || continue
+  _tk_i=$((_tk_i + 1))
+  sed -e "s|\"session_id\": \"test-stdin290\"|\"session_id\": \"test-tick-c${_tk_i}-$$\"|" \
+      -e "s|\"transcript_path\": \"[^\"]*\"|\"transcript_path\": \"$c\"|" \
+      "$FIXTURES/stdin_2.1.290.json" > "$TK/corpus$_tk_i.json"
+  _tk_cases="$_tk_cases $TK/corpus$_tk_i.json"
+done
+for f in $_tk_cases; do
+  n=${f##*/}; sid=$(_tk_sid "$f"); rm -rf "/tmp/claude_session_$sid"
+  if _tk_until_hit "$f" "$TK/$n.hit" CLAUDE_STATUSLINE_NOW="$N70"; then
+    _tk_r "$f" "$TK/$n.full" CLAUDE_STATUSLINE_NOW="$N70" CLAUDE_STATUSLINE_TICK=0
+    assert_eq "$n: hit == full render" "same" \
+      "$(cmp -s "$TK/$n.hit" "$TK/$n.full" && echo same || { diff "$TK/$n.hit" "$TK/$n.full" | head -4; })"
+  else
+    _fail "$n: never reached a cache hit"
+  fi
+  rm -rf "/tmp/claude_session_$sid"
+done
+
+echo "--- Test 71: stdin mask — only cost.total_duration_ms may differ"
+SID71="test-tick71-$$"; SD71="/tmp/claude_session_$SID71"; rm -rf "$SD71"
+sed -e "s|\"test-stdin290\"|\"$SID71\"|" -e "s|\"transcript_path\": \"[^\"]*\"|\"transcript_path\": \"$FIXTURES/jsonl_attrib.jsonl\"|" \
+  "$FIXTURES/stdin_2.1.290.json" > "$TK/a71.json"
+_tk_until_hit "$TK/a71.json" "$TK/o71" CLAUDE_STATUSLINE_NOW="$N70"; assert_eq "warm-up reaches a hit" "0" "$?"
+sed 's/"total_duration_ms": 170244962/"total_duration_ms": 170245962/' "$TK/a71.json" > "$TK/b71.json"
+assert_eq "precondition: duration edit applied" "1" "$(cmp -s "$TK/a71.json" "$TK/b71.json" && echo 0 || echo 1)"
+_tk_r "$TK/b71.json" "$TK/o71b" CLAUDE_STATUSLINE_NOW="$N70"
+assert_eq "total_duration_ms differs → hit" "hit" "$(_tk_hit "$TK/o71b" && echo hit || echo miss)"
+sed 's/"total_api_duration_ms": 1227448/"total_api_duration_ms": 1227449/' "$TK/a71.json" > "$TK/c71.json"
+_tk_r "$TK/c71.json" "$TK/o71c" CLAUDE_STATUSLINE_NOW="$N70"
+assert_eq "total_api_duration_ms differs → miss" "miss" "$(_tk_hit "$TK/o71c" && echo hit || echo miss)"
+_tk_until_hit "$TK/a71.json" "$TK/o71" CLAUDE_STATUSLINE_NOW="$N70" >/dev/null
+sed 's/"fix-statusline-cc-breakages"/"fix-statusline-cc-breakageS"/' "$TK/a71.json" > "$TK/d71.json"
+_tk_r "$TK/d71.json" "$TK/o71d" CLAUDE_STATUSLINE_NOW="$N70"
+assert_eq "one other byte differs → miss" "miss" "$(_tk_hit "$TK/o71d" && echo hit || echo miss)"
+_tk_until_hit "$TK/a71.json" "$TK/o71" CLAUDE_STATUSLINE_NOW="$N70" >/dev/null
+sed 's/"total_duration_ms": 170244962/"total_duration_ms": "170244962"/' "$TK/a71.json" > "$TK/e71.json"
+_tk_r "$TK/e71.json" "$TK/o71e" CLAUDE_STATUSLINE_NOW="$N70"
+assert_eq "duration as a string (unexpected shape) → miss" "miss" "$(_tk_hit "$TK/o71e" && echo hit || echo miss)"
+assert_eq "unexpected shape writes no cache" "no" \
+  "$(grep -q '"170244962"' "$SD71/tick.cache" 2>/dev/null && echo yes || echo no)"
+# Guard: the parser never reads total_duration_ms. A future reader of that field must break
+# this test, not the display (masked renders would then share one cached line).
+PARSE_AWK="$TK/parse.awk"
+sed -n '/^# >>> PARSE_AWK/,/^# <<< PARSE_AWK/p' "$SCRIPT" > "$PARSE_AWK"
+assert_eq "PARSE_AWK markers found" "1" "$([ -s "$PARSE_AWK" ] && echo 1 || echo 0)"
+for f in $_tk_cases "$TK/a71.json"; do
+  _m=$(sed -E 's/("total_duration_ms"[[:space:]]*:[[:space:]]*)[0-9]+/\1999999999999/' "$f")
+  assert_eq "${f##*/}: parse unchanged by the duration value" \
+    "$(awk -f "$PARSE_AWK" < "$f")" "$(printf '%s\n' "$_m" | awk -f "$PARSE_AWK")"
+done
+rm -rf "$SD71"
+
+echo "--- Test 72: misses — inputs changed, clock past valid_until, script newer"
+SID72="test-tick72-$$"; SD72="/tmp/claude_session_$SID72"; rm -rf "$SD72"
+T72="$TK/t72.jsonl"; cp "$FIXTURES/jsonl_attrib.jsonl" "$T72"
+cp "$SCRIPT" "$TK/sl72.sh"
+sed -e "s|\"test-stdin290\"|\"$SID72\"|" -e "s|\"transcript_path\": \"[^\"]*\"|\"transcript_path\": \"$T72\"|" \
+  "$FIXTURES/stdin_2.1.290.json" > "$TK/a72.json"
+_tk72() { TK_SCRIPT="$TK/sl72.sh" _tk_r "$TK/a72.json" "$TK/o72" CLAUDE_STATUSLINE_NOW="${1:-$N70}"; }
+_tk72_warm() { local i=0; while [ $i -lt 12 ]; do _tk72 "$@"; _tk_hit "$TK/o72" && return 0; sleep 0.15; i=$((i+1)); done; return 1; }
+_tk72_warm; assert_eq "warm-up reaches a hit" "0" "$?"
+_tk72_once() { _tk72 "$@"; _tk_hit "$TK/o72" && echo hit || echo miss; }
+sleep 0.05; touch "$T72"
+assert_eq "transcript touched → miss" "miss" "$(_tk72_once)"
+_tk72_warm >/dev/null; sleep 0.05
+cp "$SD72/model_breakdown.txt" "$TK/mb72"; mv "$TK/mb72" "$SD72/model_breakdown.txt"
+assert_eq "model_breakdown.txt replaced → miss" "miss" "$(_tk72_once)"
+_tk72_warm >/dev/null
+_vu72=$(head -1 "$SD72/tick.cache" | cut -d' ' -f2)
+assert_eq "valid_until = idle probe stamp + 45" "$(( $(cat "$SD72/mb_probe.ts") + 45 ))" "$_vu72"
+assert_eq "one second before valid_until → hit" "hit" "$(_tk72_once $((_vu72 - 1)))"
+assert_eq "at valid_until → miss" "miss" "$(_tk72_once "$_vu72")"
+_tk72_warm >/dev/null; sleep 0.05; touch "$TK/sl72.sh"
+assert_eq "script newer than the cache → miss" "miss" "$(_tk72_once)"
+_tk72_warm >/dev/null; : > "$SD72/model_breakdown.txt.tmp.4242"
+assert_eq "Σ regen in flight → miss" "miss" "$(_tk72_once)"
+assert_eq "…and no cache written while it runs" "no" \
+  "$([ "$SD72/tick.cache" -nt "$SD72/model_breakdown.txt.tmp.4242" ] && echo yes || echo no)"
+rm -f "$SD72/model_breakdown.txt.tmp.4242"
+_tk72_warm >/dev/null; : > "$TK/mark72"; sleep 0.05
+_tk72 >/dev/null
+assert_eq "a hit writes nothing" "" "$(find "$SD72" -newer "$TK/mark72" 2>/dev/null)"
+rm -f "$SD72/tick.cache"
+TK_SCRIPT="$TK/sl72.sh" _tk_r "$TK/a72.json" "$TK/o72" CLAUDE_STATUSLINE_NOW="$N70" CLAUDE_STATUSLINE_TICK=0
+TK_SCRIPT="$TK/sl72.sh" _tk_r "$TK/a72.json" "$TK/o72" CLAUDE_STATUSLINE_NOW="$N70" CLAUDE_STATUSLINE_TICK=0
+assert_eq "CLAUDE_STATUSLINE_TICK=0 writes no cache" "no" "$([ -e "$SD72/tick.cache" ] && echo yes || echo no)"
+rm -rf "$SD72"
+SID72b="test-tick72b-$$"; SD72b="/tmp/claude_session_$SID72b"; rm -rf "$SD72b"
+sed "s|\"test-stdin290\"|\"$SID72b\"|" "$FIXTURES/stdin_2.1.290.json" > "$TK/b72.json"   # tok_out 577, no marker
+_tk_r "$TK/b72.json" "$TK/o72b" CLAUDE_STATUSLINE_NOW="$N70"
+assert_eq "turn render writes no cache" "no:yes" \
+  "$([ -e "$SD72b/tick.cache" ] && echo yes || echo no):$([ -e "$SD72b/last_api.ts" ] && echo yes || echo no)"
+rm -rf "$SD72b"
+
+echo "--- Test 73: countdown through the fast path — colour thresholds and expiry"
+# 5m tier: base = the turn marker's second. 1h tier: a cache_log entry with a 1h write.
+_tk73() { # $1=label $2=stdin $3=cache-at $4..=hit-at seconds: each hit == full render
+  local lbl=$1 in=$2 at=$3 t; shift 3
+  _tk_until_hit "$in" "$TK/o73" CLAUDE_STATUSLINE_NOW="$at" || { _fail "$lbl: no hit at $at"; return; }
+  for t in "$@"; do
+    _tk_r "$in" "$TK/o73h" CLAUDE_STATUSLINE_NOW="$t"
+    _tk_r "$in" "$TK/o73f" CLAUDE_STATUSLINE_NOW="$t" CLAUDE_STATUSLINE_TICK=0
+    assert_eq "$lbl +$((t - B73)): hit, same bytes as a full render ($(strip_ansi < "$TK/o73f" | grep -o '~ttl [^ ]*'))" "hit:same" \
+      "$(_tk_hit "$TK/o73h" && echo hit || echo miss):$(cmp -s "$TK/o73h" "$TK/o73f" && echo same || echo diff)"
+  done
+}
+SID73="test-tick73-$$"; SD73="/tmp/claude_session_$SID73"; rm -rf "$SD73"; mkdir -p "$SD73"
+B73=$((N70 - 4000))
+sed "s|\"test-stdin290\"|\"$SID73\"|" "$FIXTURES/stdin_2.1.290.json" > "$TK/a73.json"
+echo "577:${B73}:1.0" > "$SD73/last_api.ts"
+_tk73 "5m" "$TK/a73.json" $((B73 + 100)) $((B73 + 180)) $((B73 + 181)) $((B73 + 240)) $((B73 + 241)) \
+  $((B73 + 299)) $((B73 + 300)) $((B73 + 399))
+assert_contains "5m red under a minute" "$(printf '\033[91m0:01(')" "$(_tk_r "$TK/a73.json" "$TK/o73x" CLAUDE_STATUSLINE_NOW=$((B73 + 299)); cat "$TK/o73x")"
+assert_contains "5m expired" "$(printf '\033[91mexpired(')" "$(_tk_r "$TK/a73.json" "$TK/o73x" CLAUDE_STATUSLINE_NOW=$((B73 + 300)); cat "$TK/o73x")"
+echo "${B73} 0 5000 claude-opus 136154 14 1000" > "$SD73/cache_log.txt"
+_tk73 "1h" "$TK/a73.json" $((B73 + 2350)) $((B73 + 2400)) $((B73 + 2401)) $((B73 + 2600))
+_tk73 "1h" "$TK/a73.json" $((B73 + 2990)) $((B73 + 3000)) $((B73 + 3001)) $((B73 + 3289))
+_tk73 "1h" "$TK/a73.json" $((B73 + 3400)) $((B73 + 3599)) $((B73 + 3600)) $((B73 + 3699))
+assert_contains "1h yellow at 0:19:59" "$(printf '\033[33m0:19:59(')" "$(_tk_r "$TK/a73.json" "$TK/o73x" CLAUDE_STATUSLINE_NOW=$((B73 + 2401)); cat "$TK/o73x")"
+rm -rf "$SD73"
+
+echo "--- Test 74: fork budget of a hit (Linux, bash >= 4.2)"
+if [ "$(uname)" != Linux ] || ! unshare -U -r -p -f --mount-proc true 2>/dev/null; then
+  echo "  - skipped (needs Linux unshare with user namespaces)"
+elif [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+  echo "  - skipped (bash < 4.2 reads the clock with date)"
+else
+  SID74="test-tick74-$$"; rm -rf "/tmp/claude_session_$SID74"
+  sed -e "s|\"test-stdin290\"|\"$SID74\"|" -e "s|\"transcript_path\": \"[^\"]*\"|\"transcript_path\": \"$FIXTURES/jsonl_attrib.jsonl\"|" \
+    "$FIXTURES/stdin_2.1.290.json" > "$TK/a74.json"
+  _tk_until_hit "$TK/a74.json" "$TK/o74" >/dev/null
+  printf '#!/bin/bash\nexit 0\n' > "$TK/empty.sh"
+  # pid 1 of a fresh pid namespace runs one script; last_pid then counts every process made.
+  _forks() { unshare -U -r -p -f --mount-proc bash -c \
+    'bash "$1" < "$2" >/dev/null 2>&1; read -r _ _ _ _ l < /proc/loadavg; echo "${l#*/}"' _ "$1" "$2"; }
+  _f0=$(_forks "$TK/empty.sh" "$TK/a74.json")
+  _f1=$(CLAUDE_STATUSLINE_PRICING_CACHE="$FIXTURES/pricing_golden.txt" _forks "$SCRIPT" "$TK/a74.json")
+  assert_eq "a hit forks nothing beyond bash itself" "$_f0" "$_f1"
+  rm -rf "/tmp/claude_session_$SID74"
+fi
+echo "--- Test 75: fmt_tok_v (integer arithmetic) prints what fmt_tok (awk) prints"
+eval "$(sed -n '/^fmt_tok() {/,/^}/p;/^fmt_tok_v() {/,/^}/p' "$SCRIPT")"
+_ftbad=""
+for v in 0 7 999 1000 1049 1050 1051 1149 1150 1250 1251 1949 1950 1951 9949 9950 9951 9999 10000 10499 \
+    10500 10501 99499 99500 999499 999500 999999 1000000 1049999 1050000 1050001 1149999 1150000 1250000 \
+    1950000 9950000 9999999 99950000 123456789 999999999999999 1234567890123456 0007 001500 "" 1.5 -3; do
+  fmt_tok_v "$v"; [ "$_ft" = "$(fmt_tok "$v" 2>/dev/null)" ] || _ftbad="$_ftbad '$v'→'$_ft'"
+done
+assert_eq "same text on boundaries, ties, padding and non-integers" "" "$_ftbad"
+rm -rf "$TK"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""

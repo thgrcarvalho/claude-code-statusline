@@ -34,6 +34,17 @@ EOF
 }
 _dbg() { [ "${CLAUDE_STATUSLINE_DEBUG:-}" = 1 ] && echo "statusline: $*" >&2; return 0; }
 
+# Colors
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+WHITE=$'\033[97m'
+CYAN=$'\033[36m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+RED=$'\033[91m'
+BLUE=$'\033[34m'
+
 mode=stdin; opt_pane=""; opt_session=""; opt_transcript=""; opt_tmux=0; opt_line=""; opt_socket=""; opt_turn=""
 # Any flag selects transcript mode, and stdin is never read there: tmux #() gives the command
 # no input, so a cat would only block or read garbage.
@@ -65,19 +76,122 @@ if [ $# -gt 0 ]; then
   [ -n "$opt_line" ] && [ "$opt_line" -lt "$opt_turn" ] && { _usage >&2; exit 2; }
   [ -n "$opt_pane$opt_session$opt_transcript" ] || { _usage >&2; exit 2; }
 else
-  input=$(cat)
+  # Builtin read, no fork. $(cat) semantics: trailing newlines stripped. read -d '' stops
+  # at a NUL (JSON never carries one; $(cat) dropped NULs), and the cat is kept for the rest.
+  input=""
+  if IFS= read -r -d '' input; then input="$input$(cat)"; fi
+  while :; do case "$input" in *$'\n') input=${input%$'\n'} ;; *) break ;; esac; done
 fi
 
-# Colors
-RESET=$'\033[0m'
-BOLD=$'\033[1m'
-DIM=$'\033[2m'
-WHITE=$'\033[97m'
-CYAN=$'\033[36m'
-GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
-RED=$'\033[91m'
-BLUE=$'\033[34m'
+# Epoch seconds without a fork where bash allows it: EPOCHSECONDS (5.0+), printf %(%s)T (4.2+),
+# date(1) on bash 3.2. One clock read per render, shared by every branch below.
+if [ -n "${CLAUDE_STATUSLINE_NOW:-}" ]; then now=$CLAUDE_STATUSLINE_NOW   # env: tests only
+elif [ -n "${EPOCHSECONDS:-}" ]; then now=$EPOCHSECONDS
+elif [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 2 ]; }; then
+  printf -v now '%(%s)T' -1
+else now=$(date +%s); fi
+
+# TTL countdown text and colour for <elapsed seconds> on the 1h tier ($2 = 1) or the 5m tier.
+# Shared by the full render and the tick-cache hit below, so both print the same bytes.
+_ttl_fmt() {
+  local r
+  _ttl_color=$GREEN
+  if [ "$2" = 1 ]; then
+    r=$((3600 - $1))
+    if [ "$r" -le 0 ]; then _ttl_timer="expired"; _ttl_color=$RED
+    else
+      printf -v _ttl_timer '%d:%02d:%02d' $((r / 3600)) $(((r % 3600) / 60)) $((r % 60))
+      if [ "$r" -lt 600 ]; then _ttl_color=$RED
+      elif [ "$r" -lt 1200 ]; then _ttl_color=$YELLOW; fi
+    fi
+  else
+    r=$((300 - $1))
+    if [ "$r" -le 0 ]; then _ttl_timer="expired"; _ttl_color=$RED
+    else
+      printf -v _ttl_timer '%d:%02d' $((r / 60)) $((r % 60))
+      if [ "$r" -lt 60 ]; then _ttl_color=$RED
+      elif [ "$r" -lt 120 ]; then _ttl_color=$YELLOW; fi
+    fi
+  fi
+}
+
+# ── Tick cache (hook mode) ──────────────────────────────────────────────────────────────
+# An idle session re-renders every refreshInterval with the same input, and the full render
+# costs ~60 forks. The full render stores its output in <state dir>/tick.cache with the
+# countdown cut out; a later render with the same stdin and unchanged inputs prints that
+# output with the countdown recomputed, using builtins only. Any doubt is a miss.
+# Stdin is compared with the digits of cost.total_duration_ms masked: Claude Code (measured
+# on 2.1.329) steps that field by the refresh interval on every idle tick, and this script
+# never reads it. Anything else that differs is a miss. tests/test.sh guards that the mask
+# never changes what _parse_stdin extracts.
+# Layout: "tick1 <valid_until> <ttl base|N> <is_1h> <prefix len> <suffix len> <n deps>",
+# a config line, one "f<path>" (a regular file older than the cache) or "-<path>" (absent)
+# line per input, then prefix, suffix and the masked stdin. Lengths are bytes (LC_ALL=C).
+TICK_ON=1; [ "${CLAUDE_STATUSLINE_TICK:-1}" = 0 ] && TICK_ON=0   # env: 0 disables read and write
+_tkey=""
+# Sets _tkey to $input with the first total_duration_ms value's digits replaced by "#".
+# Absent key: _tkey is the stdin itself. Any other shape returns 1 (no caching).
+_tick_mask() {
+  local k='"total_duration_ms"' pre rest sep
+  # ${input#*"$k"} would be quadratic in bash (~1 ms on a 3 KB stdin); %% plus an offset is not.
+  pre=${input%%"$k"*}
+  [ "${#pre}" = "${#input}" ] && { _tkey=$input; return 0; }
+  rest=${input:$((${#pre} + ${#k}))}
+  sep=${rest%%[0-9]*}
+  case "$sep" in *[!:[:space:]]*|*:*:*) return 1 ;; *:*) ;; *) return 1 ;; esac
+  rest=${rest#"$sep"}
+  case "$rest" in [0-9]*) ;; *) return 1 ;; esac
+  _tkey="$pre$k$sep#${rest#"${rest%%[!0-9]*}"}"
+}
+_tick_cfg() { _tcfg="${BASH_SOURCE[0]}|${CLAUDE_STATUSLINE_PRICING_CACHE:-/tmp/claude_pricing.txt}"; }
+
+_tick_hit() {
+  local r sep sid f t vu base is1h pl sl nd cfg line i=0 g elapsed body
+  r=${input#*\"session_id\"}; [ "$r" = "$input" ] && return 1
+  sep=${r%%\"*}
+  case "$sep" in *[!:[:space:]]*|*:*:*) return 1 ;; *:*) ;; *) return 1 ;; esac
+  r=${r#"$sep"}; r=${r#\"}; sid=${r%%\"*}
+  case "$sid" in ''|*[!A-Za-z0-9_.-]*|.*) return 1 ;; esac
+  f="/tmp/claude_session_${sid}/tick.cache"
+  [ -f "$f" ] || return 1
+  # A Σ regen in flight lands with its mtime backdated to its scan start: never trust -nt then.
+  for g in "/tmp/claude_session_${sid}/model_breakdown.txt".tmp*; do [ -e "$g" ] && return 1; done
+  _tick_mask || return 1
+  _tick_cfg
+  {
+    IFS=' ' read -r t vu base is1h pl sl nd || return 1
+    [ "$t" = tick1 ] || return 1
+    for g in "$vu" "$pl" "$sl" "$nd"; do case "$g" in ''|*[!0-9]*) return 1 ;; esac; done
+    case "$base" in N) ;; ''|*[!0-9]*) return 1 ;; esac
+    case "$is1h" in 0|1) ;; *) return 1 ;; esac
+    [ "$now" -lt "$vu" ] || return 1
+    IFS= read -r cfg || return 1
+    [ "$cfg" = "$_tcfg" ] || return 1
+    while [ "$i" -lt "$nd" ]; do
+      IFS= read -r line || return 1
+      case "$line" in
+        f*) [ -f "${line#f}" ] && [ "$f" -nt "${line#f}" ] || return 1 ;;
+        -*) [ -f "${line#-}" ] && return 1 ;;
+        *) return 1 ;;
+      esac
+      i=$((i + 1))
+    done
+    IFS= read -r -d '' body || :   # 1 at EOF, the normal end
+  } < "$f" || return 1
+  [ "${#body}" -ge $((pl + sl)) ] || return 1
+  [ "${body:$((pl + sl))}" = "$_tkey" ] || return 1
+  if [ "$base" = N ]; then elapsed=0; else elapsed=$((now - base)); fi
+  _ttl_fmt "$elapsed" "$is1h"
+  printf '%s%s%s%s' "${body:0:pl}" "$_ttl_color" "$_ttl_timer" "${body:pl:sl}"
+}
+
+if [ "$mode" = stdin ] && [ "$TICK_ON" = 1 ]; then
+  _tick_hit && { _dbg "tick cache hit"; exit 0; }
+fi
+# Full render from here. _tick_vu: the earliest second at which a repeat of this render
+# would take another branch (lowered by the idle probe and the cache_log future guard).
+_tick_vu=$((now + 300))
+_tick_until() { [ "$1" -lt "$_tick_vu" ] && _tick_vu=$1; return 0; }
 
 # Convert ISO 8601 UTC timestamp to epoch seconds (cross-platform: GNU date and BSD date).
 iso_to_epoch() {
@@ -254,8 +368,8 @@ fi
 # never win; older CLIs sent a numeric level there, which the string match ignores.
 # Emits 12 newline-separated values in a fixed order —
 # empty when a key is absent, so the reads below stay in sync.
-_parse_stdin() {
-  printf '%s\n' "$input" | awk '
+_PARSE_AWK='
+# >>> PARSE_AWK (tests/test.sh extracts and runs this exact program)
 function sval(s, key,   m) {
   if (match(s, "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\"")) {
     m = substr(s, RSTART, RLENGTH)
@@ -299,8 +413,8 @@ END {
   ej = index(eseg, "}"); if (ej > 0) eseg = substr(eseg, 1, ej)
   print sval(eseg, "level")
 }
+# <<< PARSE_AWK
 '
-}
 
 # Transcript mode: the same 12 values, synthesized from the tail of the main transcript.
 # Source = the newest main-conversation API response (sub-agent files feed only the Σ rows,
@@ -409,7 +523,9 @@ _synth_cached() {
   fi
 }
 
-{
+# Hook mode: awk exec'd straight from the command substitution (one fork; a function or a
+# pipe there costs one or two more). Transcript mode keeps the process substitution.
+_read12() {
   read -r model
   read -r model_id
   read -r ctx_pct
@@ -422,7 +538,13 @@ _synth_cached() {
   read -r session_id
   read -r transcript_path
   read -r effort
-} < <(if [ "$mode" = stdin ]; then _parse_stdin; else _synth_cached; fi)
+}
+if [ "$mode" = stdin ]; then
+  _parsed=$(awk "$_PARSE_AWK" <<< "$input")
+  _read12 <<< "$_parsed"
+else
+  _read12 < <(_synth_cached)
+fi
 
 model="${model:-?}"
 ctx_pct="${ctx_pct:-0}"
@@ -441,7 +563,6 @@ session_id="${session_id:-default}"
 if [ "$tok_out" = "0" ] && [ "$tok_fresh" = "0" ] && [ "$tok_cr" = "0" ]; then
   ctx_pct=0
 fi
-ctx_pct=$(echo "$ctx_pct" | awk '{printf "%d", $1 + 0.5}')
 
 # Derive a friendly display name from an API model ID.
 # Handles all current and future Claude models without hardcoding versions.
@@ -538,6 +659,29 @@ fmt_tok() {
   fi
 }
 
+# fmt_tok into _ft without a fork. Integer rounding gives the same text as the awk printf
+# except on an exact decimal tie, where %.1f rounds the binary double (1.25 → 1.2, 1.05 →
+# 1.1): those values, and anything longer than 15 digits, take fmt_tok itself. A value that
+# is not a plain digit string fails every [ -ge ] in fmt_tok and prints as is; so here.
+fmt_tok_v() {
+  local n=$1 v q
+  case "$n" in ''|*[!0-9]*) _ft=$n; return ;; esac
+  [ "${#n}" -gt 15 ] && { _ft=$(fmt_tok "$n"); return; }
+  v=$((10#$n))
+  if [ "$v" -ge 1000000 ]; then
+    [ $((v % 100000)) -eq 50000 ] && { _ft=$(fmt_tok "$n"); return; }
+    q=$(((v + 50000) / 100000)); printf -v _ft '%d.%dM' $((q / 10)) $((q % 10))
+  elif [ "$v" -ge 10000 ]; then
+    # int(n/1000 + 0.5): a .5 quotient is exact in binary, so no tie case here.
+    printf -v _ft '%dk' $(((v + 500) / 1000))
+  elif [ "$v" -ge 1000 ]; then
+    [ $((v % 100)) -eq 50 ] && { _ft=$(fmt_tok "$n"); return; }
+    q=$(((v + 50) / 100)); printf -v _ft '%d.%dk' $((q / 10)) $((q % 10))
+  else
+    _ft=$n
+  fi
+}
+
 # Format cost
 fmt_c() {
   echo "$1" | awk '{
@@ -548,36 +692,70 @@ fmt_c() {
   }'
 }
 
-cost_fmt=$(echo "$cost" | awk '{
-  if ($1 < 0.01)      printf "$0.00"
-  else if ($1 < 10)   printf "$%.2f", $1
-  else if ($1 < 1000) printf "$%.1f", $1
-  else                printf "$%.0f", $1
-}')
-
-cache_pct=$(echo "$tok_fresh $tok_cr $tok_cw" | awk '{
-  total = $1 + $2 + $3
-  if (total > 0) printf "%d", ($2 / total) * 100
-  else printf "0"
-}')
-
-if [ "$ctx_pct" -lt 50 ]; then ctx_color=$GREEN
-elif [ "$ctx_pct" -lt 80 ]; then ctx_color=$YELLOW
-else ctx_color=$RED; fi
-
 # State dir per session (defined early so the compact-boundary cache below can live here).
 STATE_DIR="/tmp/claude_session_${session_id}"
-mkdir -p "$STATE_DIR" 2>/dev/null
+[ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null
+# Tick cache start marker, created before any state file is read: its mtime is this render's
+# start, and the cache is written at the end only if every input is still strictly older
+# than it. A Σ regen already in flight would later install a breakdown backdated to its scan
+# start, before this marker, so no marker (and no cache) then.
+_tick_m=""
+if [ "$mode" = stdin ] && [ "$TICK_ON" = 1 ]; then
+  _tick_m="${STATE_DIR}/tick.cache.tmp.$$"
+  for _g in "${STATE_DIR}/model_breakdown.txt".tmp*; do [ -e "$_g" ] && _tick_m=""; done
+  [ -n "$_tick_m" ] && { : > "$_tick_m" 2>/dev/null || _tick_m=""; }
+fi
 # Turn state (turn marker, cache_log) is per mode. The hook and a tmux bar can render the
 # same session at once, and they read tok_out from different sources (stdin current_usage vs
 # the last transcript line, which can lag or differ on multi-iteration turns): sharing the
 # marker would flap the turn gate between them and restart the ttl on every render. The Σ
 # breakdown and its caches below are pure functions of the files and stay shared.
 TURN_DIR="$STATE_DIR"
-[ "$mode" = transcript ] && TURN_DIR="${STATE_DIR}/transcript" && mkdir -p "$TURN_DIR" 2>/dev/null
+[ "$mode" = transcript ] && TURN_DIR="${STATE_DIR}/transcript" && { [ -d "$TURN_DIR" ] || mkdir -p "$TURN_DIR" 2>/dev/null; }
 LAST_STATE="${TURN_DIR}/last_api.ts"
 SESSION_COST="${STATE_DIR}/session_cost.txt"
 MODEL_BREAKDOWN="${STATE_DIR}/model_breakdown.txt"  # space-delimited, 16 cols: see the Σ render
+COMPACT_STATE="${STATE_DIR}/compact_cost.txt"       # see the /compact cost capture below
+
+# Local Σ sum (top-line fallback cost) and the /compact state, read with builtins up front so
+# the number formatting below is one awk call. The Σ render rewrites SESSION_COST later in a
+# render, after the top line has used it; the same order as before.
+local_cost_val=""
+[ -f "$SESSION_COST" ] && { IFS= read -r -d '' local_cost_val < "$SESSION_COST" || :; }
+local_cost_val=${local_cost_val//[[:space:]]/}   # was: cat | tr -d '[:space:]'
+compact_count=0; compact_total=0; _cc_prev_cost=""; _cc_prev_floor=""; _cc_line=""
+if [ "$mode" = stdin ] && [ -f "$COMPACT_STATE" ]; then
+  IFS= read -r _cc_line < "$COMPACT_STATE"
+  read -r compact_count compact_total _cc_prev_cost _cc_prev_floor <<< "$_cc_line"
+fi
+compact_count="${compact_count:-0}"; compact_total="${compact_total:-0}"
+
+# One awk for every float the line needs (was one echo|awk per value, three forks each).
+# Each expression is the previous per-value program unchanged, on the same input field.
+# Output: ctx% rounded, cache hit %, harness cost %.6f, harness>0, local>0, then fmt_c of
+# the harness cost, the local cost and the /compact total.
+_nums=$(awk '
+function fc(v) {
+  if (v < 0.0001) return "$0"
+  else if (v < 0.01) return sprintf("$%.4f", v)
+  else if (v < 1) return sprintf("$%.3f", v)
+  return sprintf("$%.2f", v)
+}
+{ printf "%d\n", $1 + 0.5
+  total = $2 + $3 + $4
+  if (total > 0) printf "%d\n", ($3 / total) * 100; else print "0"
+  printf "%.6f\n", $5 + 0
+  h = ($5 + 0 > 0) ? 1 : 0; print h
+  h = ($6 + 0 > 0) ? 1 : 0; print h
+  print fc($5); print fc($6); print fc($7) }' \
+  <<< "$ctx_pct $tok_fresh $tok_cr $tok_cw $cost ${local_cost_val:-0} $compact_total")
+{ read -r ctx_pct; read -r cache_pct; read -r _cc_now; read -r have_harness; read -r have_local
+  read -r _fc_cost; read -r _fc_local; read -r _fc_compact; } <<< "$_nums"
+[ -n "$local_cost_val" ] || have_local=0
+
+if [ "$ctx_pct" -lt 50 ]; then ctx_color=$GREEN
+elif [ "$ctx_pct" -lt 80 ]; then ctx_color=$YELLOW
+else ctx_color=$RED; fi
 
 # Locate the most recent compact_boundary in the transcript (always, not just when ctx_pct==0).
 # Used for ctx% recovery and for the cache_log floor that guards stale pre-compact entries.
@@ -640,8 +818,6 @@ if [ "$cache_pct" -gt 80 ]; then hit_color=$GREEN
 elif [ "$cache_pct" -gt 40 ]; then hit_color=$YELLOW
 else hit_color=$RED; fi
 
-now=$(date +%s)
-
 # /compact cost capture. Claude Code folds the /compact summarization cost into
 # cost.total_cost_usd (verified empirically: total_cost_usd steps up by the exact
 # compaction cost at the render where a new compact_boundary appears). The transcript
@@ -649,17 +825,30 @@ now=$(date +%s)
 # harness total across renders and, when a new compact floor appears, attribute the cost
 # rise since the last completed turn to that compaction (see the baseline note below).
 # State (single line): "<count> <total_cost> <prev_cost> <prev_floor>"
-COMPACT_STATE="${STATE_DIR}/compact_cost.txt"
-_cc_now=$(echo "${cost:-0}" | awk '{printf "%.6f", $1+0}')
+# COMPACT_STATE, its four fields and _cc_now (cost as %.6f) are read/computed above.
+# LAST_STATE fields as `cut -d: -f1/2/3` printed them, without forks: a line with no ":" is
+# every field. A file of more than one line (never written by this script) takes cut itself.
+_ls_read() {
+  local all=""
+  _ls_f1=""; _ls_f2=""; _ls_f3=""
+  [ -f "$LAST_STATE" ] || return 0
+  IFS= read -r -d '' all < "$LAST_STATE" || :
+  all=${all%$'\n'}
+  case "$all" in
+    *$'\n'*)
+      _ls_f1=$(cut -d: -f1 "$LAST_STATE" 2>/dev/null); _ls_f2=$(cut -d: -f2 "$LAST_STATE" 2>/dev/null)
+      _ls_f3=$(cut -d: -f3 "$LAST_STATE" 2>/dev/null) ;;
+    *:*)
+      _ls_f1=${all%%:*}; all=${all#*:}; _ls_f2=${all%%:*}
+      case "$all" in *:*) all=${all#*:}; _ls_f3=${all%%:*} ;; esac ;;
+    *) _ls_f1=$all; _ls_f2=$all; _ls_f3=$all ;;
+  esac
+}
 _cc_floor="${compact_floor_ts:-0}"
-compact_count=0; compact_total=0; _cc_prev_cost=""; _cc_prev_floor=""
+_cc_captured=0
 # Hook mode only: the capture needs the harness total, which the transcript never carries
 # (CC 2.1.290). Transcript mode would count every compaction at $0 and print a bogus row.
 if [ "$mode" = stdin ]; then
-  if [ -f "$COMPACT_STATE" ]; then
-    read -r compact_count compact_total _cc_prev_cost _cc_prev_floor < "$COMPACT_STATE"
-  fi
-  compact_count="${compact_count:-0}"; compact_total="${compact_total:-0}"
   # Only count once we have a prior baseline (don't retroactively price compacts that
   # predate this feature — their deltas were never captured). A non-zero floor change
   # since the last render means a new compaction just completed.
@@ -671,7 +860,8 @@ if [ "$mode" = stdin ]; then
     # pre-compact anchor — nothing meaningful bills between a turn and a compaction except the
     # compaction itself (plus negligible internal Haiku). LAST_STATE col 3 holds it; fall back
     # to the previous render's cost for pre-upgrade sessions that haven't rewritten LAST_STATE.
-    _cc_base=$(cut -d: -f3 "$LAST_STATE" 2>/dev/null)
+    _cc_captured=1
+    _ls_read; _cc_base=$_ls_f3
     [ -z "$_cc_base" ] && _cc_base="${_cc_prev_cost:-$_cc_now}"
     _cc_delta=$(awk -v a="$_cc_now" -v b="$_cc_base" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.6f", d}')
     compact_count=$((compact_count + 1))
@@ -680,19 +870,25 @@ if [ "$mode" = stdin ]; then
     # compaction with no real turn in between measures only its own incremental cost, not this
     # one's again. Preserve cols 1-2 (tok_out, ts) so turn detection and the TTL base are intact.
     if [ -f "$LAST_STATE" ]; then
-      _ls1=$(cut -d: -f1 "$LAST_STATE" 2>/dev/null); _ls2=$(cut -d: -f2 "$LAST_STATE" 2>/dev/null)
+      _ls1=$_ls_f1; _ls2=$_ls_f2
       echo "${_ls1:-0}:${_ls2:-$now}:${_cc_now}" > "${LAST_STATE}.tmp" && mv "${LAST_STATE}.tmp" "$LAST_STATE"
     fi
   fi
-  echo "${compact_count} ${compact_total} ${_cc_now} ${_cc_floor}" > "${COMPACT_STATE}.tmp" \
-    && mv "${COMPACT_STATE}.tmp" "$COMPACT_STATE"
+  # Rewritten only when the line changes: an unchanged rewrite every render would leave the
+  # tick cache (which must be strictly newer than this file) one render behind forever.
+  _cc_new="${compact_count} ${compact_total} ${_cc_now} ${_cc_floor}"
+  if [ "$_cc_new" != "$_cc_line" ] || [ ! -f "$COMPACT_STATE" ]; then
+    echo "$_cc_new" > "${COMPACT_STATE}.tmp" && mv "${COMPACT_STATE}.tmp" "$COMPACT_STATE"
+  fi
+  [ "$_cc_captured" = 1 ] && _fc_compact=$(fmt_c "$compact_total")
 fi
 
 prev_tout="-1"
 prev_ts=$now
+_ls_exists=0
 if [ -f "$LAST_STATE" ]; then
-  prev_tout=$(cut -d: -f1 "$LAST_STATE" 2>/dev/null)
-  prev_ts=$(cut -d: -f2 "$LAST_STATE" 2>/dev/null)
+  _ls_exists=1
+  _ls_read; prev_tout=$_ls_f1; prev_ts=$_ls_f2
 fi
 
 # Model-family prefix used BOTH to tag new cache_log entries (write path, below) and to
@@ -721,13 +917,21 @@ _cache_filter="${_cache_filter:-unknown}"
 # turn gate (as always) and the idle-render probe after it. Background Workflow fleets
 # (CC 2.1.2xx) append subagent JSONLs and bill into the harness total for many minutes
 # without any main-loop turn — regen gated on turns alone froze the local Σ for a
-# fleet's whole duration. Ends by touching MB_PROBE, which rate-limits the idle probe.
+# fleet's whole duration. Ends by stamping MB_PROBE, which rate-limits the idle probe.
+# MB_PROBE holds the epoch second of the last probe, written with a builtin redirection
+# (was touch + stat: three forks). An empty file (an older script's touch) reads by mtime.
 MB_PROBE="${STATE_DIR}/mb_probe.ts"
+_mb_spawned=0   # a regen this render started: its result lands later, so no tick cache
 mb_regen_check() {
   # Per-model breakdown from JSONL files (parent + sub-agents)
   if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-    session_uuid=$(basename "$transcript_path" .jsonl)
-    project_dir=$(dirname "$transcript_path")
+    # basename/dirname by expansion: transcript_path is a regular file's path here.
+    session_uuid=${transcript_path##*/}
+    [ "$session_uuid" != .jsonl ] && session_uuid=${session_uuid%.jsonl}
+    case "$transcript_path" in
+      */*) project_dir=${transcript_path%/*}; [ -n "$project_dir" ] || project_dir=/ ;;
+      *)   project_dir=. ;;
+    esac
     subagent_dir="${project_dir}/${session_uuid}/subagents"
 
     # Σ regen throttle. Every regen rescans every JSONL (parent + subagents) — hundreds of
@@ -781,6 +985,7 @@ mb_regen_check() {
       # Parse JSONL with awk: deduplicate by uuid and message.id, group by model and origin
       # Output: one line per model, 16 columns (main sums, sub-agent sums, agent count)
       _mb_tmp="${MODEL_BREAKDOWN}.tmp.$$"
+      _mb_spawned=1
       ( : > "${_mb_tmp}.s"
         awk '
 # >>> SIGMA_AWK (tests/test.sh extracts and runs this exact program)
@@ -900,10 +1105,12 @@ END {
         rm -f "${_mb_tmp}.s" "$_mb_tmp" 2>/dev/null ) >/dev/null 2>&1 &
     fi
   fi
-  touch "$MB_PROBE" 2>/dev/null
+  echo "$now" > "$MB_PROBE" 2>/dev/null
 }
 
+_turn=0
 if [ "$tok_out" -gt 0 ] && [ "$tok_out" != "$prev_tout" ]; then
+  _turn=1
   prev_ts=$now
   mb_regen_check
   [ -x "${HOME}/.claude/refresh-pricing.sh" ] && "${HOME}/.claude/refresh-pricing.sh" >/dev/null 2>&1 &
@@ -1017,10 +1224,17 @@ fi
 # render can't retry-storm. This path never writes LAST_STATE or cache_log, so the
 # crash-safe marker-last ordering above is unaffected.
 if [ "$tok_out" = "$prev_tout" ] && [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-  _pb_m=$(stat -c '%Y' "$MB_PROBE" 2>/dev/null || stat -f '%m' "$MB_PROBE" 2>/dev/null)
+  _pb_m=""
+  [ -f "$MB_PROBE" ] && IFS= read -r _pb_m < "$MB_PROBE"
+  case "$_pb_m" in
+    ''|*[!0-9]*) _pb_m=$(stat -c '%Y' "$MB_PROBE" 2>/dev/null || stat -f '%m' "$MB_PROBE" 2>/dev/null) ;;
+  esac
   if [ -z "$_pb_m" ] || [ "$((now - _pb_m))" -ge 45 ]; then
-    touch "$MB_PROBE" 2>/dev/null
+    echo "$now" > "$MB_PROBE" 2>/dev/null
     mb_regen_check
+    _tick_until "$((now + 45))"
+  else
+    _tick_until "$((_pb_m + 45))"
   fi
 fi
 
@@ -1040,7 +1254,8 @@ if [ -f "${TURN_DIR}/cache_log.txt" ]; then
     # win the "most recent" test below and wedge the ctx display indefinitely — clearing /tmp
     # was the only recovery. _ts must be a plain integer and not implausibly far in the future.
     case "$_ts" in ''|*[!0-9]*) continue ;; esac
-    [ "$_ts" -gt "$((now + 300))" ] && continue
+    # A future entry starts counting at _ts - 300: the tick cache must expire by then.
+    [ "$_ts" -gt "$((now + 300))" ] && { _tick_until "$((_ts - 300))"; continue; }
     # Skip entries that predate the last /compact — that cache no longer exists at Anthropic
     [ "$_ts" -lt "$compact_floor_ts" ] && continue
     case "$_m" in
@@ -1078,41 +1293,17 @@ fi
 # Falls back to prev_ts (most recent overall API call) when the model has no log entries yet.
 ttl_base_ts=$model_last_ts
 [ "$ttl_base_ts" -eq 0 ] && ttl_base_ts=$prev_ts
+# For the tick cache: N = the base is this render's clock (no marker, no entry), so the
+# countdown never moves; anything but a plain integer is not cached.
+_tick_base=$ttl_base_ts
+[ "$model_last_ts" -eq 0 ] && [ "$_ls_exists" = 0 ] && _tick_base=N
 
-# TTL countdown — 5m tier
+# TTL countdown: the 1h tier when the most recent cache write used it (common in Claude
+# Code), else the 5m tier, so the timer reflects the actual expiry of the cached context.
 elapsed=$((now - ttl_base_ts))
-remaining=$((300 - elapsed))
-cache_color=$GREEN
-if [ "$remaining" -le 0 ]; then
-  cache_timer="expired"; cache_color=$RED
-else
-  mins=$((remaining / 60)); secs=$((remaining % 60))
-  cache_timer=$(printf "%d:%02d" "$mins" "$secs")
-  if [ "$remaining" -lt 60 ]; then cache_color=$RED
-  elif [ "$remaining" -lt 120 ]; then cache_color=$YELLOW; fi
-fi
-
-# TTL countdown — 1h tier (same timestamp base; shown only when split data available)
-remaining_1h=$((3600 - elapsed))
-cache_1h_color=$GREEN
-if [ "$remaining_1h" -le 0 ]; then
-  cache_1h_timer="expired"; cache_1h_color=$RED
-else
-  h=$((remaining_1h / 3600)); m=$(( (remaining_1h % 3600) / 60 )); s=$((remaining_1h % 60))
-  cache_1h_timer=$(printf "%d:%02d:%02d" "$h" "$m" "$s")
-  if [ "$remaining_1h" -lt 600 ]; then cache_1h_color=$RED
-  elif [ "$remaining_1h" -lt 1200 ]; then cache_1h_color=$YELLOW; fi
-fi
-
-# Build TTL display: show how much of the current context is cached and when it expires.
-# Use the 1h-tier countdown when the most recent cache write used the 1h tier (common in
-# Claude Code), so the timer reflects the actual expiry of the user's cached context.
-if [ "$model_last_is_1h" -eq 1 ]; then
-  _ttl_timer="$cache_1h_timer"; _ttl_color="$cache_1h_color"
-else
-  _ttl_timer="$cache_timer"; _ttl_color="$cache_color"
-fi
-cache_timer_display="${_ttl_color}${_ttl_timer}($(fmt_tok $model_last_cached))${RESET}"
+_ttl_fmt "$elapsed" "$model_last_is_1h"
+fmt_tok_v "$model_last_cached"
+_ttl_tail="(${_ft})${RESET}"
 
 # Top-line cost: harness total_cost_usd first, local transcript sum second. The harness
 # counter includes sub-agent calls as they land (measured on CC 2.1.290: each agent call
@@ -1124,33 +1315,35 @@ cache_timer_display="${_ttl_color}${_ttl_timer}($(fmt_tok $model_last_cached))${
 # time. On 2.1.29x the two should be close; what separates them is internal calls, a
 # reset counter, /compact (harness only) and pricing-table drift. Neither figure is the
 # authoritative Anthropic bill.
-local_cost_val=$(cat "$SESSION_COST" 2>/dev/null | tr -d '[:space:]')
-have_harness=0; have_local=0
-[ -n "$cost" ] && awk -v v="$cost" 'BEGIN{exit !(v+0 > 0)}' 2>/dev/null && have_harness=1
-[ -n "$local_cost_val" ] && awk -v v="$local_cost_val" 'BEGIN{exit !(v+0 > 0)}' 2>/dev/null && have_local=1
+# local_cost_val, have_harness/have_local and the fmt_c texts come from the one awk above.
 if [ $have_harness -eq 1 ] && [ $have_local -eq 1 ]; then
-  cost_display="${YELLOW}$(fmt_c "$cost")${RESET}${DIM} / ${RESET}${YELLOW}$(fmt_c "$local_cost_val")${RESET}"
+  cost_display="${YELLOW}${_fc_cost}${RESET}${DIM} / ${RESET}${YELLOW}${_fc_local}${RESET}"
 elif [ $have_harness -eq 1 ]; then
-  cost_display="${YELLOW}$(fmt_c "$cost")${RESET}"
+  cost_display="${YELLOW}${_fc_cost}${RESET}"
 elif [ $have_local -eq 1 ]; then
-  cost_display="${YELLOW}$(fmt_c "$local_cost_val")${RESET}"
+  cost_display="${YELLOW}${_fc_local}${RESET}"
 else
   cost_display="${DIM}\$0.00${RESET}"
 fi
 
 sep="${DIM} │ ${RESET}"
 
-# Line 1: current turn
+# Line 1: current turn. The output is assembled as prefix + countdown + suffix, the split
+# the tick cache stores.
 effort_str=""
 [ -n "$effort" ] && effort_str="${DIM} (${effort})${RESET}"
-printf "%s%s%s%s%s" \
+printf -v _o1 "%s%s%s%s%s" \
   "${BOLD}${CYAN}${model}${RESET}" "$effort_str" "${sep}" \
   "${ctx_str}" "${sep}"
-printf "%s%s" "$cost_display" "${sep}"
-printf "↑${WHITE}%s${RESET} ${GREEN}+%sr${RESET} ${YELLOW}+%sw${RESET} ↓${BLUE}%s${RESET}" \
-  "$(fmt_tok $tok_fresh)" "$(fmt_tok $tok_cr)" "$(fmt_tok $tok_cw)" "$(fmt_tok $tok_out)"
-printf "%s hit ${hit_color}%s%%${RESET}" "${sep}" "$cache_pct"
-printf "%s ~ttl %s\n" "${sep}" "$cache_timer_display"
+printf -v _o2 "%s%s" "$cost_display" "${sep}"
+fmt_tok_v "$tok_fresh"; _t1=$_ft; fmt_tok_v "$tok_cr"; _t2=$_ft
+fmt_tok_v "$tok_cw"; _t3=$_ft; fmt_tok_v "$tok_out"; _t4=$_ft
+printf -v _o3 "↑${WHITE}%s${RESET} ${GREEN}+%sr${RESET} ${YELLOW}+%sw${RESET} ↓${BLUE}%s${RESET}" \
+  "$_t1" "$_t2" "$_t3" "$_t4"
+printf -v _o4 "%s hit ${hit_color}%s%%${RESET}" "${sep}" "$cache_pct"
+_out_pre="${_o1}${_o2}${_o3}${_o4}${sep} ~ttl "
+_out_post="${_ttl_tail}"$'\n'
+_sigma_rerendered=0
 
 # NOTE: Σ rows are computed from transcript JSONLs (parent + subagents), so each row can
 # split main vs sub-agent spend. /usage shows the harness ledger instead: per process and
@@ -1159,6 +1352,8 @@ printf "%s ~ttl %s\n" "${sep}" "$cache_timer_display"
 # Lines 2+: per-model totals — read directly from flat-text breakdown (no jq needed)
 # Columns: model, main in cr cw5m cw1h out web fetch, agent in cr cw5m cw1h out web fetch, agents
 total_cost=0
+SIGMA_TXT="${STATE_DIR}/sigma_render.txt"
+SIGMA_KEY="${STATE_DIR}/sigma_render.key"
 if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
   # The Σ rows depend only on model_breakdown.txt (rewritten per-turn) and the pricing file
   # (refreshed at most daily) — yet this loop reran every 1s render, re-deriving pricing and
@@ -1166,14 +1361,16 @@ if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
   # reuse the cache. total_cost is persisted in SESSION_COST, which the top-line reads directly,
   # so a cache hit needn't recompute it. stat() the mtime BEFORE reading the file so a concurrent
   # background rewrite can only cause an extra recompute, never a stale row cached under a new key.
-  SIGMA_TXT="${STATE_DIR}/sigma_render.txt"
-  SIGMA_KEY="${STATE_DIR}/sigma_render.key"
   _mb_m=$(stat -c '%Y' "$MODEL_BREAKDOWN" 2>/dev/null || stat -f '%m' "$MODEL_BREAKDOWN" 2>/dev/null)
   _pr_m=$(stat -c '%Y' "$PRICING_CACHE" 2>/dev/null || stat -f '%m' "$PRICING_CACHE" 2>/dev/null)
   _sigma_key="${_mb_m:-0}:${_pr_m:-0}"
-  if [ -f "$SIGMA_TXT" ] && [ "$(cat "$SIGMA_KEY" 2>/dev/null)" = "$_sigma_key" ]; then
-    cat "$SIGMA_TXT"
+  _sk=""; [ -f "$SIGMA_KEY" ] && { IFS= read -r -d '' _sk < "$SIGMA_KEY" || :; }
+  while :; do case "$_sk" in *$'\n') _sk=${_sk%$'\n'} ;; *) break ;; esac; done   # $(cat) semantics
+  if [ -f "$SIGMA_TXT" ] && [ "$_sk" = "$_sigma_key" ]; then
+    _sig=""; IFS= read -r -d '' _sig < "$SIGMA_TXT" || :   # every byte, as cat printed it
+    _out_post="${_out_post}${_sig}"
   else
+    _sigma_rerendered=1   # SESSION_COST changes below, after the top line read it
     _sigma_out=""
     # Columns 2-8 main conversation, 9-15 sub-agents, 16 distinct agent files. An 8-column
     # file from the previous script (kept in /tmp until the next regen) mixes both origins
@@ -1218,7 +1415,7 @@ if [ -f "$MODEL_BREAKDOWN" ] && [ -s "$MODEL_BREAKDOWN" ]; then
         "$(fmt_tok $((m_cw5m + m_cw1h + a_cw5m + a_cw1h)))" "$(fmt_tok $((m_out + a_out)))" \
         "$(fmt_c $m_cost)" "$ws_suffix" "$who_suffix")"$'\n'
     done < "$MODEL_BREAKDOWN"
-    printf '%s' "$_sigma_out"
+    _out_post="${_out_post}${_sigma_out}"
     printf '%s' "$_sigma_out" > "${SIGMA_TXT}.tmp" 2>/dev/null && mv "${SIGMA_TXT}.tmp" "$SIGMA_TXT" 2>/dev/null
     echo "$_sigma_key" > "${SIGMA_KEY}.tmp" 2>/dev/null && mv "${SIGMA_KEY}.tmp" "$SIGMA_KEY" 2>/dev/null
     # Write local sum as fallback for when harness omits cost.total_cost_usd
@@ -1231,6 +1428,56 @@ fi
 # at the compact boundary (see the /compact cost capture above). Shown only once a
 # compaction has occurred while this feature was active.
 if [ "${compact_count:-0}" -gt 0 ]; then
-  printf "${DIM}Σ ${CYAN}/compact${RESET}${DIM} ×%s: ${YELLOW}%s${RESET}\n" \
-    "$compact_count" "$(fmt_c "$compact_total")"
+  printf -v _oc "${DIM}Σ ${CYAN}/compact${RESET}${DIM} ×%s: ${YELLOW}%s${RESET}\n" \
+    "$compact_count" "$_fc_compact"
+  _out_post="${_out_post}${_oc}"
+fi
+
+printf '%s%s%s%s' "$_out_pre" "$_ttl_color" "$_ttl_timer" "$_out_post"
+
+# Tick cache write, after the output is out. Only a render whose repeat would print the same
+# bytes apart from the countdown: no turn, no /compact capture, no Σ regen started, no Σ
+# re-render (it rewrote SESSION_COST after the top line read it), a countdown base the hit
+# path can use, and every input strictly older than the start marker (a write by anyone
+# during this render, this render's own compact_cost.txt update included, means no cache;
+# the next render caches). The marker glob rm also sweeps markers of killed renders, and
+# of live ones, whose check then fails: never a wrong cache, at worst none.
+_tick_write() {
+  local f="${STATE_DIR}/tick.cache" tmp d deps="" n=0 g
+  [ -n "$_tick_m" ] && [ -f "$_tick_m" ] || return 0
+  [ "$_turn" = 0 ] && [ "$_cc_captured" = 0 ] && [ "$_mb_spawned" = 0 ] \
+    && [ "$_sigma_rerendered" = 0 ] || return 0
+  case "$_tick_base" in N) ;; ''|*[!0-9]*) return 0 ;; esac
+  case "$model_last_is_1h" in 0|1) ;; *) return 0 ;; esac
+  _tick_mask || return 0
+  _tick_cfg
+  case "$_tcfg" in *$'\n'*) return 0 ;; esac
+  for d in "$transcript_path" "$MODEL_BREAKDOWN" "$PRICING_CACHE" "$SESSION_COST" "$LAST_STATE" \
+      "${TURN_DIR}/cache_log.txt" "$COMPACT_STATE" "$SIGMA_TXT" "$SIGMA_KEY" "${BASH_SOURCE[0]}"; do
+    [ -n "$d" ] || continue
+    case "$d" in *$'\n'*) return 0 ;; esac
+    if [ -f "$d" ]; then
+      [ "$_tick_m" -nt "$d" ] || return 0
+      deps="${deps}f${d}"$'\n'
+    else
+      deps="${deps}-${d}"$'\n'
+    fi
+    n=$((n + 1))
+  done
+  tmp="${f}.tmp.new.$$"
+  printf 'tick1 %s %s %s %s %s %s\n%s\n%s%s%s%s' "$_tick_vu" "$_tick_base" "$model_last_is_1h" \
+    "${#_out_pre}" "${#_out_post}" "$n" "$_tcfg" "$deps" "$_out_pre" "$_out_post" "$_tkey" \
+    > "$tmp" 2>/dev/null || return 0
+  # Re-check after the write: an input written between the loop above and now is newer
+  # than the marker; a regen started since would land backdated.
+  for d in "$transcript_path" "$MODEL_BREAKDOWN" "$PRICING_CACHE" "$SESSION_COST" "$LAST_STATE" \
+      "${TURN_DIR}/cache_log.txt" "$COMPACT_STATE" "$SIGMA_TXT" "$SIGMA_KEY"; do
+    [ -n "$d" ] && [ -f "$d" ] && { [ "$_tick_m" -nt "$d" ] || return 0; }
+  done
+  for g in "${MODEL_BREAKDOWN}".tmp*; do [ -e "$g" ] && return 0; done
+  mv -f "$tmp" "$f" 2>/dev/null
+}
+if [ -n "$_tick_m" ]; then
+  _tick_write
+  rm -f "${STATE_DIR}"/tick.cache.tmp.* 2>/dev/null
 fi
